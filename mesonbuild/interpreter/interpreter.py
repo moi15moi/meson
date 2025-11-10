@@ -3385,6 +3385,9 @@ class Interpreter(InterpreterBase, HoldableObject):
         sources = self.source_strings_to_files(sources)
         objs = kwargs['objects']
         kwargs['dependencies'] = extract_as_list(kwargs, 'dependencies')
+        for dep in kwargs['dependencies']:
+            mlog.warning(f"jeremie - kwargs['dependencies']={dep.get_all_link_args()} - {type(dep)}")
+
         kwargs['extra_files'] = self.source_strings_to_files(kwargs['extra_files'])
         self.check_sources_exist(os.path.join(self.source_root, self.subdir), sources)
         if targetclass not in {build.Executable, build.SharedLibrary, build.SharedModule, build.StaticLibrary, build.Jar}:

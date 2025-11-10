@@ -357,15 +357,21 @@ class _PythonDependencyBase(_Base):
             else:
                 key = 'dynamic'
             sysroot = environment.properties[self.for_machine].get_sys_root() or ''
+            mlog.warning(f"jeremie - sysroot={[sysroot + self.build_config['libpython'][key]]}")
+
             return [sysroot + self.build_config['libpython'][key]]
 
+        mlog.warning(f"jeremie - self.platform={self.platform}")
         if self.platform.startswith('win'):
             vernum = self.variables.get('py_version_nodot')
             verdot = self.variables.get('py_version_short')
             imp_lower = self.variables.get('implementation_lower', 'python')
             if self.static:
                 libpath = Path('libs') / f'libpython{vernum}.a'
+                mlog.warning(f"jeremie - static")
+
             else:
+
                 if limited_api:
                     vernum = vernum[0]
                 comp = self.get_compiler()
@@ -381,6 +387,8 @@ class _PythonDependencyBase(_Base):
                         else:
                             libpath = Path(f'python{vernum}.dll')
                 else:
+                    mlog.warning(f"jeremie - else {vernum} - {limited_api}")
+
                     if self.is_freethreaded:
                         libpath = Path('libs') / f'python{vernum}t.lib'
                     else:
@@ -428,6 +436,8 @@ class _PythonDependencyBase(_Base):
         if not lib.exists():
             mlog.log('Could not find Python3 library {!r}'.format(str(lib)))
             return None
+        mlog.warning(f"jeremie - final = {str(lib)}")
+
         return [str(lib)]
 
     def find_libpy_windows(self, env: 'Environment', limited_api: bool = False) -> None:
@@ -435,6 +445,8 @@ class _PythonDependencyBase(_Base):
         Find python3 libraries on Windows and also verify that the arch matches
         what we are building for.
         '''
+        mlog.warning(f"jeremie - find_libpy_windows")
+
         try:
             pyarch = self.get_windows_python_arch()
         except DependencyException as e:
@@ -452,6 +464,8 @@ class _PythonDependencyBase(_Base):
             self.is_found = False
             return
         self.link_args = largs
+        mlog.warning(f"jeremie - self.link_args={self.link_args}")
+
         self.is_found = True
 
 

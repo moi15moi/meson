@@ -8,6 +8,8 @@ import re
 import subprocess
 import typing as T
 
+from mesonbuild import mlog
+
 from .. import mesonlib
 from ..arglist import CompilerArgs
 from ..linkers import RSPFileSyntax
@@ -336,6 +338,7 @@ class DmdLikeCompilerMixin(CompilerMixinBase):
             for la in linkargs:
                 if la.startswith('--out-implib='):
                     # Import library name
+                    mlog.warning(f"jeremie - translate_arg_to_windows={la[13:].strip()}")
                     args.append('-L=/IMPLIB:' + la[13:].strip())
         elif arg.startswith('-mscrtlib='):
             args.append(arg)

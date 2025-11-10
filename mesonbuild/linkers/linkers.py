@@ -9,6 +9,8 @@ import os
 import typing as T
 import re
 
+from mesonbuild import mlog
+
 from .base import ArLikeLinker, RSPFileSyntax
 from .. import mesonlib
 from ..mesonlib import EnvironmentException, MesonException
@@ -1362,6 +1364,8 @@ class VisualStudioLikeLinkerMixin(DynamicLinkerBase):
         self.machine = machine
         self.direct = direct
         self.rsp_syntax = rsp_syntax
+        mlog.warning(f"jeremie - __init__ = {exelist}")
+
 
     def invoked_by_compiler(self) -> bool:
         return not self.direct
@@ -1402,6 +1406,8 @@ class VisualStudioLikeLinkerMixin(DynamicLinkerBase):
 
     def import_library_args(self, implibname: str) -> T.List[str]:
         """The command to generate the import library."""
+        mlog.warning(f"jeremie - import_library_args={implibname}")
+
         return self._apply_prefix(['/IMPLIB:' + implibname])
 
     def rsp_file_syntax(self) -> RSPFileSyntax:

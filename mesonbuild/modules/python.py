@@ -156,7 +156,13 @@ class PythonInstallation(_ExternalProgramHolder['PythonExternalProgram']):
         target_suffix = self.suffix
 
         new_deps = mesonlib.extract_as_list(kwargs, 'dependencies')
+        mlog.warning(f"jeremie - before 0 - new_deps = {new_deps}")
+        for dep in new_deps:
+            mlog.warning(f"jeremie - before 0 - dep = {dep.get_all_link_args()} - {type(dep)}")
+
         pydep = next((dep for dep in new_deps if isinstance(dep, _PythonDependencyBase)), None)
+        mlog.warning(f"jeremie - pydep = {pydep}")
+
         if pydep is None:
             pydep = self._dependency_method_impl({})
             if not pydep.found():
@@ -183,6 +189,10 @@ class PythonInstallation(_ExternalProgramHolder['PythonExternalProgram']):
             new_cpp_args.append(limited_api_definition)
             kwargs['cpp_args'] = new_cpp_args
 
+            mlog.warning(f"jeremie - before 2 - new_deps = {new_deps}")
+            for dep in new_deps:
+                mlog.warning(f"jeremie - before 2 - new_deps = {dep.get_all_link_args()}")
+
             # On Windows, the limited API DLL is python3.dll, not python3X.dll.
             for_machine = kwargs['native']
             if self.interpreter.environment.machines[for_machine].is_windows():
@@ -193,6 +203,10 @@ class PythonInstallation(_ExternalProgramHolder['PythonExternalProgram']):
 
                 new_deps.remove(pydep)
                 new_deps.append(pydep_copy)
+                #pydep = pydep_copy
+            mlog.warning(f"jeremie - after - new_deps = {new_deps}")
+            for dep in new_deps:
+                mlog.warning(f"jeremie - after - dep = {dep.get_all_link_args()}")
 
             # When compiled under MSVC, Python's PC/pyconfig.h forcibly inserts pythonMAJOR.MINOR.lib
             # into the linker path when not running in debug mode via a series #pragma comment(lib, "")
@@ -200,7 +214,11 @@ class PythonInstallation(_ExternalProgramHolder['PythonExternalProgram']):
             # use of the 'limited_api' kwarg
             compilers = self.interpreter.environment.coredata.compilers[for_machine]
             if any(compiler.get_id() == 'msvc' for compiler in compilers.values()):
+                mlog.warning(f"jeremie - msvc")
+
                 pyver = pydep.version.replace('.', '')
+                mlog.warning(f"jeremie - msvc pyver = {pyver}")
+
                 python_windows_debug_link_exception = f'/NODEFAULTLIB:python{pyver}_d.lib'
                 python_windows_release_link_exception = f'/NODEFAULTLIB:python{pyver}.lib'
 
@@ -223,10 +241,15 @@ class PythonInstallation(_ExternalProgramHolder['PythonExternalProgram']):
 
         kwargs['name_prefix'] = ''
         kwargs['name_suffix'] = target_suffix
+        mlog.warning(f"jeremie - target_suffix={target_suffix}")
 
         if kwargs['gnu_symbol_visibility'] == '' and \
                 (self.is_pypy or mesonlib.version_compare(self.version, '>=3.9')):
             kwargs['gnu_symbol_visibility'] = 'inlineshidden'
+
+        for dep in kwargs['dependencies']:
+            mlog.warning(f"jeremie - extension_module_method - END - kwargs['dependencies']={dep.get_all_link_args()} - {type(dep)}")
+        mlog.warning(f"jeremie - extension_module_method - END - kwargs={kwargs}")
 
         return self.interpreter.build_target(self.current_node, args, kwargs, SharedModule)
 
