@@ -543,6 +543,9 @@ class PythonSystemDependency(SystemDependency, _PythonDependencyBase):
         SystemDependency.__init__(self, name, environment, kwargs)
         _PythonDependencyBase.__init__(self, installation, kwargs.get('embed', False), for_machine)
 
+        mlog.warning(f"jeremie - self.link_libpython = {self.link_libpython}")
+
+
         # For most platforms, match pkg-config behavior. iOS is a special case;
         # check for that first, so that check takes priority over
         # `link_libpython` (which *shouldn't* be set, but just in case)
