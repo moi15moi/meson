@@ -298,6 +298,8 @@ class _PythonDependencyBase(_Base):
             self.compile_args += ['-DPy_GIL_DISABLED']
 
     def find_libpy(self, environment: 'Environment') -> None:
+        mlog.warning(f"jeremie - find_libpy is called")
+
         if self.build_config:
             path = self.build_config['libpython'].get('dynamic')
             if not path:
