@@ -274,7 +274,6 @@ class _PythonDependencyBase(_Base):
             self.variables = python_holder.info['variables']
 
         self.paths = python_holder.info['paths']
-        mlog.warning(f"jeremie - _PythonDependencyBase = self.link_libpython {self.link_libpython}")
 
         # The "-embed" version of python.pc / python-config was introduced in 3.8,
         # and distutils extension linking was changed to be considered a non embed
@@ -286,6 +285,7 @@ class _PythonDependencyBase(_Base):
         # mirror its behavior. See https://github.com/mesonbuild/meson/issues/4117
         if not self.link_libpython:
             self.link_libpython = embed
+        mlog.warning(f"jeremie - _PythonDependencyBase = self.link_libpython {self.link_libpython}")
 
         self.info: T.Optional[T.Dict[str, str]] = None
         if mesonlib.version_compare(self.version, '>= 3.0'):
