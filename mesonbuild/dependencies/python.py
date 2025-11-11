@@ -250,6 +250,7 @@ class _PythonDependencyBase(_Base):
 
     def __init__(self, python_holder: 'BasicPythonExternalProgram', embed: bool,
                  for_machine: 'MachineChoice'):
+
         self.for_machine = for_machine
         self.embed = embed
         self.build_config = python_holder.build_config
@@ -273,6 +274,7 @@ class _PythonDependencyBase(_Base):
             self.variables = python_holder.info['variables']
 
         self.paths = python_holder.info['paths']
+        mlog.warning(f"jeremie - _PythonDependencyBase = self.link_libpython {self.link_libpython}")
 
         # The "-embed" version of python.pc / python-config was introduced in 3.8,
         # and distutils extension linking was changed to be considered a non embed
@@ -482,6 +484,7 @@ class PythonPkgConfigDependency(PkgConfigDependency, _PythonDependencyBase):
                  for_machine: 'MachineChoice'):
         pkg_embed = '-embed' if embed and mesonlib.version_compare(installation.info['version'], '>=3.8') else ''
         pkg_name = f'python-{installation.version}{pkg_embed}'
+        mlog.warning(f"jeremie - PythonPkgConfigDependency - pkg_name = {pkg_name}")
 
         if installation.build_config:
             pkg_libdir = installation.build_config.get('c_api.pkgconfig_path')
