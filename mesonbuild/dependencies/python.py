@@ -306,8 +306,10 @@ class _PythonDependencyBase(_Base):
             path = sysroot + path
             if not os.path.isfile(path):
                 raise DependencyException('Python dynamic library does not exist or is not a file')
+
             self.link_args = [path]
             self.is_found = True
+            mlog.warning(f"jeremie - find_libpy 1 - {self.link_args}")
             return
 
         if self.is_pypy:
@@ -324,6 +326,8 @@ class _PythonDependencyBase(_Base):
             if 'ABIFLAGS' in self.variables:
                 libname += self.variables['ABIFLAGS']
             libdirs = []
+
+        mlog.warning(f"jeremie - find_libpy 2 - {libname}")
 
         largs = self.clib_compiler.find_library(libname, environment, libdirs)
         if largs is not None:

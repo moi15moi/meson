@@ -6,6 +6,8 @@ from __future__ import annotations
 import copy, json, os, shutil, re
 import typing as T
 
+from mesonbuild.dependencies.base import InternalDependency
+
 from . import ExtensionModule, ModuleInfo
 from .. import mesonlib
 from .. import mlog
@@ -13,7 +15,7 @@ from ..options import UserFeatureOption
 from ..build import known_shmod_kwargs, CustomTarget, CustomTargetIndex, BuildTarget, GeneratedList, StructuredSources, ExtractedObjects, SharedModule
 from ..dependencies import NotFoundDependency
 from ..dependencies.detect import get_dep_identifier, find_external_dependency
-from ..dependencies.python import BasicPythonExternalProgram, python_factory, _PythonDependencyBase
+from ..dependencies.python import BasicPythonExternalProgram, PythonSystemDependency, python_factory, _PythonDependencyBase
 from ..interpreter import extract_required_kwarg, primitives as P_OBJ
 from ..interpreter.interpreterobjects import _ExternalProgramHolder
 from ..interpreter.type_checking import NoneType, DEPENDENCY_KWS, PRESERVE_PATH_KW, SHARED_MOD_KWS
@@ -201,8 +203,21 @@ class PythonInstallation(_ExternalProgramHolder['PythonExternalProgram']):
                 if not pydep_copy.found():
                     raise mesonlib.MesonException('Python dependency supporting limited API not found')
 
+                for dep in new_deps:
+                    if isinstance(dep, InternalDependency):
+                        for ext_dep in dep.ext_deps:
+                            if isinstance(ext_dep, PythonSystemDependency):
+                                mlog.warning(f"jeremie - before = {ext_dep.__dict__}")
+
+                    mlog.warning(f"jeremie - before removing pydep = {dep.get_all_link_args()} {type(dep)}")
                 new_deps.remove(pydep)
+                new_deps.remove(pydep)
+                for dep in new_deps:
+                    mlog.warning(f"jeremie - after removing pydep = {dep.get_all_link_args()}")
+
                 new_deps.append(pydep_copy)
+                mlog.warning(f"jeremie - pydep_copy = {pydep_copy.get_all_link_args()}")
+
                 #pydep = pydep_copy
             mlog.warning(f"jeremie - after - new_deps = {new_deps}")
             for dep in new_deps:
