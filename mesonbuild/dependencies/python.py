@@ -589,6 +589,8 @@ class PythonSystemDependency(SystemDependency, _PythonDependencyBase):
 def python_factory(env: 'Environment', for_machine: 'MachineChoice',
                    kwargs: DependencyObjectKWs,
                    installation: T.Optional['BasicPythonExternalProgram'] = None) -> T.List['DependencyGenerator']:
+    mlog.warning(f"jeremie - python_factory is called")
+
     # We can't use the factory_methods decorator here, as we need to pass the
     # extra installation argument
     methods = process_method_kw({DependencyMethods.PKGCONFIG, DependencyMethods.SYSTEM}, kwargs)
@@ -602,14 +604,20 @@ def python_factory(env: 'Environment', for_machine: 'MachineChoice',
 
     if DependencyMethods.PKGCONFIG in methods:
         if from_installation:
+            mlog.warning(f"jeremie - candidates PKGCONFIG from_installation")
+
             candidates.append(functools.partial(PythonPkgConfigDependency, env, kwargs, installation, embed, for_machine))
         else:
+            mlog.warning(f"jeremie - candidates PKGCONFIG else")
             candidates.append(functools.partial(PkgConfigDependency, 'python3', env, kwargs))
 
     if DependencyMethods.SYSTEM in methods:
+        mlog.warning(f"jeremie - candidates DependencyMethods.SYSTEM")
         candidates.append(functools.partial(PythonSystemDependency, 'python', env, kwargs, installation, for_machine))
 
     if DependencyMethods.EXTRAFRAMEWORK in methods:
+        mlog.warning(f"jeremie - candidates EXTRAFRAMEWORK")
+
         nkwargs = kwargs.copy()
         if mesonlib.version_compare(installation.version, '>= 3'):
             # There is a python in /System/Library/Frameworks, but that's python 2.x,
