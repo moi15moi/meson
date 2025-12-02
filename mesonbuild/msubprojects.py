@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, InitVar
+import json
 import sys, os, subprocess
 import argparse
 import asyncio
@@ -12,6 +13,7 @@ from concurrent.futures.thread import ThreadPoolExecutor
 from pathlib import Path
 import typing as T
 import tarfile
+import urllib
 import zipfile
 
 from . import mlog
@@ -145,6 +147,79 @@ class Runner:
     def pre_update_wrapdb(options: 'UpdateWrapDBArguments') -> None:
         options.releases = get_releases(options.allow_insecure)
 
+    @staticmethod
+    def is_github_url(url: str) -> bool:
+        try:
+            host = urllib.parse.urlparse(url).hostname
+            return host == "github.com"
+        except urllib.error.HTTPError:
+            return False
+        
+    @staticmethod
+    def is_gitlab_url(url: str) -> bool:
+        try:
+            host = urllib.parse.urlparse(url).hostname
+            return host.startswith("gitlab.")
+        except urllib.error.HTTPError:
+            return False
+    
+    def update_wrap_git(self) -> None:
+        self.log(f'Checking latest git version for {self.wrap.name}...')
+
+        if self.wrap.type != "git":
+            return
+        
+        # https://gitlab.freedesktop.org/fontconfig/fontconfig
+        #url = self.wrap.get('url')
+        #url = 'https://gitlab.freedesktop.org/fontconfig/fontconfig'
+        url = 'https://gitlab.com/gitlab-org/gitlab-runner'
+        #url = 'https://gitlab.com/zeitgitter/gitta-timestamps'
+        
+        if self.is_github_url(url):
+            self.log('The url is from github')
+            rest_url = f'https://api.github.com/repos{urllib.parse.urlparse(url).path}/releases/latest'
+
+            req = urllib.request.Request(rest_url)
+
+            try:
+                with urllib.request.urlopen(req) as response:
+                    data = json.loads(response.read().decode())
+            except urllib.error.HTTPError:
+                self.log(f'Couldn\'t fetch the git release for {self.wrap.name}')
+                return
+
+            if self.wrap.get('revision') == data["tag_name"]:
+                self.log(f'{self.wrap.name} is up to date')
+                return
+            else:
+                self.log(f'{self.wrap.name} has a new version {data["tag_name"]}')
+                new_version = data["tag_name"]
+        elif self.is_gitlab_url(url):
+            self.log('The url is from gitlab')
+            rest_url = f'https://{urllib.parse.urlparse(url).hostname}/api/v4/projects/{urllib.parse.quote(urllib.parse.urlparse(url).path.lstrip('/'), safe="")}/releases/permalink/latest'
+            self.log(rest_url)
+
+            req = urllib.request.Request(rest_url)
+
+            try:
+                with urllib.request.urlopen(req) as response:
+                    data = json.loads(response.read().decode())
+            except urllib.error.HTTPError:
+                self.log(f'Couldn\'t fetch the git release for {self.wrap.name}')
+                return
+
+            if self.wrap.get('revision') == data["tag_name"]:
+                self.log(f'{self.wrap.name} is up to date')
+                return
+            else:
+                self.log(f'{self.wrap.name} has a new version {data["tag_name"]}')
+                new_version = data["tag_name"]
+        else:
+            self.log(f'The git-platform for the wrap {self.wrap.name} is not supported. We couldn\'t update the wrap file')
+        
+        # TODO How to edit the wrap file to write the new_version?
+
+
     def update_wrapdb(self) -> bool:
         self.log(f'Checking latest WrapDB version for {self.wrap.name}...')
         options = T.cast('UpdateWrapDBArguments', self.options)
@@ -153,6 +228,7 @@ class Runner:
         info = options.releases.get(self.wrap.name)
         if not info:
             self.log('  -> Wrap not found in wrapdb')
+            self.update_wrap_git()
             return True
 
         # Determine current version
