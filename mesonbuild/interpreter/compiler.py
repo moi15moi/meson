@@ -6,7 +6,6 @@ from __future__ import annotations
 import collections
 import enum
 import functools
-import os
 import itertools
 import typing as T
 
@@ -827,9 +826,8 @@ class CompilerHolder(ObjectHolder['Compiler']):
     @InterpreterObject.method('get_supported_link_arguments')
     def get_supported_link_arguments_method(self, args: T.Tuple[T.List[str]], kwargs: 'TYPE_kwargs') -> T.List[str]:
         supported_args: T.List[str] = []
-        for arg in args[0]:
-            if self._has_argument_impl([arg], mode=_TestMode.LINKER):
-                supported_args.append(arg)
+        supported_args.extend(arg for arg in args[0]
+                              if self._has_argument_impl([arg], mode=_TestMode.LINKER))
         return supported_args
 
     @FeatureNew('compiler.first_supported_link_argument', '0.46.0')
@@ -936,5 +934,4 @@ class CompilerHolder(ObjectHolder['Compiler']):
         self.interpreter.add_target(tg.name, tg)
         # Expose this target as list of its outputs, so user can pass them to
         # other targets, list outputs, etc.
-        private_dir = os.path.relpath(self.interpreter.backend.get_target_private_dir(tg), self.interpreter.subdir)
-        return [build.CustomTargetIndex(tg, os.path.join(private_dir, o)) for o in tg.outputs]
+        return [build.CustomTargetIndex(tg, o) for o in tg.outputs]

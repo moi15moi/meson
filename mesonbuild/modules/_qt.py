@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import posixpath
 import shutil
 import typing as T
 import xml.etree.ElementTree as ET
@@ -14,7 +15,7 @@ from . import ModuleReturnValue, ExtensionModule
 from .. import build
 from .. import mlog
 from ..dependencies import DependencyMethods, find_external_dependency, Dependency, ExternalLibrary, InternalDependency
-from ..mesonlib import MesonException, File, FileMode, version_compare, Popen_safe
+from ..mesonlib import MesonException, File, FileMode, version_compare, OrderedSet, Popen_safe
 from ..interpreter import extract_required_kwarg
 from ..interpreter.type_checking import (
     DEPENDENCY_METHOD_KW, INSTALL_DIR_KW, INSTALL_KW, REQUIRED_KW, STR_PARG,
@@ -203,7 +204,7 @@ _MODULE_NAME_RE = f'[^{_MODULE_NAME_PUNCT}0-9][^{_MODULE_NAME_PUNCT}]*(\\.[^{_MO
 
 _SOURCES_EMPTY_KWS: KwargInfo[list[str | File | build.GeneratedTypes]] = KwargInfo(
     'sources',
-    ContainerTypeInfo(list, (File, str, build.CustomTarget, build.CustomTargetIndex, build.GeneratedList), allow_empty=False),
+    ContainerTypeInfo(list, (File, str, build.CustomTarget, build.CustomTargetIndex, build.GeneratedList)),
     listify=True,
     default=[],
     since_values={
@@ -375,7 +376,7 @@ class QtBaseModule(ExtensionModule):
                     path_from_rcc = os.path.normpath(os.path.join(rcc_dirname, resource_path))
                     # a)
                     if path_from_rcc.startswith(state.environment.build_dir):
-                        result.append(File(is_built=True, subdir=state.subdir, fname=resource_path))
+                        result.append(File(is_built=True, subdir=state.current_build_dir, fname=resource_path))
                     # b)
                     else:
                         result.append(File(is_built=False, subdir=state.subdir, fname=path_from_rcc))
@@ -564,16 +565,16 @@ class QtBaseModule(ExtensionModule):
             raise build.InvalidArguments('At least one of the "headers" or "sources" keyword arguments must be provided and not empty')
 
         inc = state.get_include_args(include_dirs=kwargs['include_directories'])
-        compile_args: T.List[str] = []
+        compile_args: OrderedSet[str] = OrderedSet()
         depends: T.List[T.Union[build.BuildTarget, build.CustomTarget, build.CustomTargetIndex]] = []
         for dep in kwargs['dependencies']:
-            compile_args.extend(a for a in dep.get_all_compile_args() if a.startswith(('-I', '-F', '-D')))
+            compile_args.update(a for a in dep.get_all_compile_args() if a.startswith(('-I', '-F', '-D')))
             if isinstance(dep, InternalDependency):
                 for incl in dep.include_directories:
-                    compile_args.extend(f'-I{i}' for i in incl.abs_string_list(self.interpreter.source_root, self.interpreter.environment.build_dir))
-                for src in dep.sources:
-                    if isinstance(src, (build.CustomTarget, build.BuildTarget, build.CustomTargetIndex)):
-                        depends.append(src)
+                    compile_args.update(f'-I{i}' for i in incl.abs_string_list(self.interpreter.source_root, self.interpreter.environment.build_dir))
+                depends.extend(src for src in dep.sources
+                               if isinstance(src, (build.CustomTarget, build.BuildTarget,
+                                                   build.CustomTargetIndex)))
 
         output: T.List[build.GeneratedList] = []
 
@@ -585,7 +586,7 @@ class QtBaseModule(ExtensionModule):
         DEPFILE_ARGS: T.List[str] = ['--output-dep-file'] if self._moc_supports_depfiles else []
         JSON_ARGS: T.List[str] = ['--output-json'] if do_output_json else []
 
-        arguments = kwargs['extra_args'] + DEPFILE_ARGS + JSON_ARGS + inc + compile_args + ['@INPUT@', '-o', '@OUTPUT0@']
+        arguments = kwargs['extra_args'] + DEPFILE_ARGS + JSON_ARGS + inc + list(compile_args) + ['@INPUT@', '-o', '@OUTPUT0@']
         preserve_path_from = os.path.join(state.source_root, state.subdir) if kwargs['preserve_paths'] else None
         if kwargs['headers']:
             header_gen_output: T.List[str] = ['moc_@BASENAME@.cpp']
@@ -706,7 +707,7 @@ class QtBaseModule(ExtensionModule):
                 raise MesonException('qt.compile_translations: Cannot specify both ts_files and qresource')
             if os.path.dirname(qresource) != '':
                 raise MesonException('qt.compile_translations: qresource file name must not contain a subdirectory.')
-            qresource_file = File.from_built_file(state.subdir, qresource)
+            qresource_file = File.from_built_file(state.current_build_dir, qresource)
             infile_abs = os.path.join(state.environment.source_dir, qresource_file.relative_name())
             outfile_abs = os.path.join(state.environment.build_dir, qresource_file.relative_name())
             os.makedirs(os.path.dirname(outfile_abs), exist_ok=True)
@@ -763,17 +764,16 @@ class QtBaseModule(ExtensionModule):
             return ModuleReturnValue(translations, [translations])
 
     def _source_to_files(self, state: ModuleState, sources: T.List[str | build.TargetSources]) -> T.List[File]:
-
-        content_files = []
+        content_files: list[File] = []
         for s in sources:
             if isinstance(s, (build.CustomTarget, build.CustomTargetIndex)):
-                for o in s.get_outputs():
-                    content_files.append(File.from_built_file(state.backend.get_target_dir(s), o))
+                content_files.extend(File.from_built_file(state.backend.get_target_dir(s), o)
+                                     for o in s.get_outputs())
             elif isinstance(s, File):
                 content_files.append(s)
             elif isinstance(s, build.GeneratedList):
-                for gen_src in s.get_outputs():
-                    content_files.append(File.from_built_file(state.subdir, gen_src))
+                content_files.extend(File.from_built_file(state.current_build_dir, gen_src)
+                                     for gen_src in s.get_outputs())
             else:
                 content_files.append(File.from_source_file(
                     state.environment.get_source_dir(),
@@ -784,7 +784,7 @@ class QtBaseModule(ExtensionModule):
 
     def _gen_qrc(self, state: ModuleState, kwargs: GenQrcKwArgs) -> File:
 
-        fileout = File.from_built_file(state.subdir, kwargs['output'])
+        fileout = File.from_built_file(state.current_build_dir, kwargs['output'])
         fileout_abs = os.path.join(state.environment.build_dir, fileout.relative_name())
         if not os.path.isdir(state.environment.build_dir):
             os.mkdir(state.environment.build_dir)
@@ -813,7 +813,7 @@ class QtBaseModule(ExtensionModule):
         #Foo.Bar/1.0 foo.bar/auto foo.bar
         import_re = re.compile(r'^(' + _MODULE_NAME_RE + r')(/((\d+(\.\d+)?)|auto))?$')
 
-        fileout = File.from_built_file(state.subdir, kwargs['output'])
+        fileout = File.from_built_file(state.current_build_dir, kwargs['output'])
         fileout_abs = os.path.join(state.environment.build_dir, fileout.relative_name())
         if not os.path.isdir(state.environment.build_dir):
             os.mkdir(state.environment.build_dir)
@@ -915,6 +915,7 @@ class QtBaseModule(ExtensionModule):
             self.tools['qmlcachegen'],
             command_args,
             [f'{target_name}_@BASENAME@.cpp'],
+            depend_files=[kwargs['qml_qrc']],
             name=f'Qml cache generation for {target_name}')
 
         output: T.List[T.Union[build.CustomTarget, build.GeneratedList]] = []
@@ -925,7 +926,7 @@ class QtBaseModule(ExtensionModule):
         qml_sources_paths = self._source_to_files(state, kwargs['qml_sources'])
         for s in qml_sources_paths:
             source_basename = os.path.basename(s.fname)
-            ressource_path = os.path.join('/', kwargs['module_prefix'], source_basename)
+            ressource_path = posixpath.join('/', kwargs['module_prefix'], source_basename)
             cachegen_inputs.append(ressource_path)
 
         cmd: CommandList = \
@@ -1070,7 +1071,7 @@ class QtBaseModule(ExtensionModule):
 
         module_prefix_list: T.List[str] = module_name.split('.')
         module_prefix: str = os.path.join(*module_prefix_list)
-        module_prefix_full: str = os.path.join(*(kwargs['resources_prefix'].split('/') + module_prefix_list))
+        module_prefix_full: str = posixpath.join(*(kwargs['resources_prefix'].split('/') + module_prefix_list))
 
         #same format as the one derived from qmltyperegistrar
         target_name = re.sub(r'[^A-Za-z0-9]', '_', module_name)

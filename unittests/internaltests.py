@@ -37,6 +37,7 @@ from mesonbuild.compilers.compilers import CompileCheckMode, ManyInOneLinkerOpti
 from mesonbuild.compilers.cpp import ClangCPPCompiler, GnuCPPCompiler, VisualStudioCPPCompiler, QccCPPCompiler
 from mesonbuild.compilers.objcpp import ClangObjCPPCompiler, GnuObjCPPCompiler
 from mesonbuild.compilers.d import DmdDCompiler, LLVMDCompiler
+from mesonbuild.compilers.cuda import CudaCompiler
 from mesonbuild.compilers.detect import detect_c_compiler
 from mesonbuild.compilers.mixins.visualstudio import MSVCCompiler, ClangClCompiler
 from mesonbuild.linkers import linkers
@@ -45,25 +46,60 @@ from mesonbuild.interpreterbase import (
     KwargInfo, PosArgInfo, VarArgInfo,
 )
 from mesonbuild.mesonlib import (
-    FileMode, LibType, MachineChoice, PerMachine, SimpleABC, Version, is_windows, is_osx,
+    FileMode, LibType, MachineChoice, SimpleABC, Version, is_windows, is_osx,
     is_cygwin, is_openbsd, search_version, MesonException, EnvironmentException, python_command,
     version_check_to_range,
 )
 from mesonbuild.options import OptionKey, UserBooleanOption
 from mesonbuild.interpreter.type_checking import (
     STR_PARG, INT_PARG, BOOL_PARG, STR_OARG, INT_OARG, STR_VARG,
-    INSTALL_MODE_KW, in_set_validator, NoneType,
+    INSTALL_MODE_KW, in_set_validator, NoneType, _pkgconfig_define_feature_validator,
 )
 from mesonbuild.dependencies.pkgconfig import PkgConfigDependency, PkgConfigInterface, PkgConfigCLI
+from mesonbuild.minstall import DirMaker
 from mesonbuild.programs import ExternalProgram
 import mesonbuild.modules.pkgconfig
-from mesonbuild import utils
 
 from run_tests import get_fake_env, get_fake_options
 
 from .helpers import IS_CI, chdir, skipIfNoPkgconfig
 
 class InternalTests(unittest.TestCase):
+
+    def test_cached_compiler_environment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_env = get_fake_env(bdir=tmpdir)
+            for machine in MachineChoice:
+                linker = linkers.GnuBFDDynamicLinker(['ld'], old_env, machine, None, [])
+                cpp = GnuCPPCompiler([], ['c++'], '12.0', machine, old_env, linker=linker)
+                cpp.get_preprocessor()
+                with mock.patch.object(cpp, 'get_default_include_dirs', return_value=[]):
+                    cuda = CudaCompiler([], ['nvcc'], '12.0', machine, cpp, old_env, linker=linker)
+                old_env.coredata.compilers[machine]['cuda'] = cuda
+            old_env.dump_coredata()
+
+            env = get_fake_env(bdir=tmpdir)
+            self.assertFalse(env.first_invocation)
+            for machine in MachineChoice:
+                cuda = env.coredata.compilers[machine]['cuda']
+                self.assertIsNot(cuda, old_env.coredata.compilers[machine]['cuda'])
+                cpp = cuda.host_compiler
+                for compiler in (cuda, cpp, cpp.get_preprocessor()):
+                    self.assertIs(compiler.environment, env)
+                    self.assertIs(compiler.linker.environment, env)
+
+    @unittest.skipIf(is_windows() or is_cygwin() or os.geteuid() == 0, 'needs a directory the test user cannot traverse')
+    def test_cmake_user_registry_unreadable_home(self):
+        from mesonbuild.dependencies.cmake import CMakeDependency
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / 'home'
+            (home / '.cmake' / 'packages' / 'Foo').mkdir(parents=True)
+            with mock.patch.dict(os.environ, {'HOME': str(home)}):
+                self.assertTrue(CMakeDependency._in_cmake_user_registry('Foo', 'foo'))
+                self.assertFalse(CMakeDependency._in_cmake_user_registry('Bar', 'bar'))
+                home.chmod(0)
+                CMakeDependency._cached_isdir.cache_clear()
+                self.assertFalse(CMakeDependency._in_cmake_user_registry('Foo', 'foo'))
 
     def test_cmake_skip_compiler_test_invalid(self):
         properties = mesonbuild.envconfig.Properties({'cmake_skip_compiler_test': True})
@@ -182,6 +218,7 @@ class InternalTests(unittest.TestCase):
 
     def test_version_number(self):
         self.assertEqual(search_version('foobar 1.2.3'), '1.2.3')
+        self.assertEqual(search_version('foobar 1.2.3-4and5.6-7-'), '1.2.3-4and5.6-7-')
         self.assertEqual(search_version('1.2.3'), '1.2.3')
         self.assertEqual(search_version('foobar 2016.10.28 1.2.3'), '1.2.3')
         self.assertEqual(search_version('2016.10.28 1.2.3'), '1.2.3')
@@ -197,6 +234,10 @@ class InternalTests(unittest.TestCase):
         self.assertEqual(search_version(r'''(FooBar LLVM-Linux 5.0.0) clang version 21.9.0
 Target: riscv64-unknown-linux-gnu
 Thread model: posix'''), '21.9.0')
+        self.assertEqual(search_version(r'''Ubuntu clang version 14.0.0-1ubuntu1.1
+Target: x86_64-pc-linux-gnu
+Thread model: posix
+InstalledDir: /usr/bin'''), '14.0.0-1ubuntu1.1')
 
         # Literal output of mvn
         self.assertEqual(search_version(r'''\
@@ -420,6 +461,68 @@ Thread model: posix'''), '21.9.0')
                 self.assertIn(key, comp.get_options())
                 self.assertEqual(comp.get_option_compile_args(None),
                                  ref.get_option_compile_args(None))
+
+    def test_msvc_import_std_id(self):
+        env = get_fake_env()
+        linker = linkers.MSVCDynamicLinker(env, MachineChoice.HOST, [])
+        cc = VisualStudioCPPCompiler([], ['cl'], '19.44.35219', MachineChoice.HOST, env, 'x64', linker=linker)
+        std_id = cc.get_import_std_id
+        base = ['/MD', '/nologo', '/utf-8', '/EHsc', '/std:c++latest', '/permissive-']
+
+        # What does not matter to the standard library module
+        for irrelevant in (['-Isome/dir', '/I.'], ['/W4', '/wd4251', '/WX'], ['/Od'], ['/O2'], ['/Z7'],
+                           ['/Fdtarget.pdb', '/Fofile.obj'], ['/showIncludes'], ['/GL', '/Gy'],
+                           ['/DNOMINMAX', '-DFOO=1'], ['file.cpp']):
+            with self.subTest(irrelevant=irrelevant):
+                self.assertEqual(std_id(base + irrelevant), std_id(base))
+
+        # The same arguments in another form
+        self.assertEqual(std_id(reversed(base)), std_id(base))
+        self.assertEqual(std_id(base + base), std_id(base))
+        self.assertEqual(std_id(['-MD', '-nologo', '-utf-8', '-EHsc', '-std:c++latest', '-permissive-']), std_id(base))
+        self.assertEqual(std_id(['/MDd', '/MT'] + base), std_id(base))  # the last C runtime wins
+        self.assertEqual(std_id(base + ['/D_HAS_EXCEPTIONS']), std_id(base + ['/D_HAS_EXCEPTIONS=1']))
+
+        # What matters, as reported by MSVC with the warning C5050
+        for relevant in (['/MDd'], ['/MT'], ['/MTd'], ['/GR-'], ['/fp:fast'], ['/J'], ['/sdl'],
+                         ['/guard:cf'], ['/std:c++20'], ['/openmp'], ['/D_ITERATOR_DEBUG_LEVEL=0'],
+                         ['/D_HAS_EXCEPTIONS=0'], ['/Zc:wchar_t-'], ['/Zp4'], ['/arch:AVX2'], ['/Gz']):
+            with self.subTest(relevant=relevant):
+                self.assertNotEqual(std_id(base + relevant), std_id(base))
+        self.assertNotEqual(std_id([a for a in base if a != '/utf-8']), std_id(base))
+
+        # A module is only valid for the compiler which built it
+        other_version = VisualStudioCPPCompiler([], ['cl'], '19.50.0', MachineChoice.HOST, env, 'x64', linker=linker)
+        self.assertNotEqual(other_version.get_import_std_id(base), std_id(base))
+        other_arch = VisualStudioCPPCompiler([], ['cl'], '19.44.35219', MachineChoice.HOST, env, 'x86', linker=linker)
+        self.assertNotEqual(other_arch.get_import_std_id(base), std_id(base))
+
+        # The arguments are the ones to compile the module with
+        self.assertEqual(cc.get_import_std_args(base + ['/Isome', '/Od', '/D_HAS_EXCEPTIONS']),
+                         ['/D_HAS_EXCEPTIONS=1', '/EHsc', '/MD', '/permissive-', '/std:c++latest', '/utf-8'])
+
+    def test_intel_fortran_standard_args(self):
+        from mesonbuild.compilers.fortran import (
+            IntelFortranCompiler, IntelLLVMFortranCompiler,
+            IntelClFortranCompiler, IntelLLVMClFortranCompiler,
+        )
+        standards = {'none': None, 'legacy': 'none', 'f95': 'f95',
+                     'f2003': 'f03', 'f2008': 'f08', 'f2018': 'f18'}
+        for compiler_class in (IntelFortranCompiler, IntelLLVMFortranCompiler,
+                               IntelClFortranCompiler, IntelLLVMClFortranCompiler):
+            compiler = object.__new__(compiler_class)
+            for standard, value in standards.items():
+                with self.subTest(compiler=compiler_class.id, standard=standard):
+                    if value is None:
+                        expected = []
+                    elif compiler_class is IntelLLVMFortranCompiler:
+                        expected = ['-stand', value]
+                    elif compiler_class is IntelFortranCompiler:
+                        expected = ['-stand=' + value]
+                    else:
+                        expected = ['/stand:' + value]
+                    with mock.patch.object(compiler, 'get_compileropt_value', return_value=standard):
+                        self.assertEqual(compiler.get_option_std_args(None), expected)
 
     def test_compiler_args_class_visualstudio(self):
         env = get_fake_env()
@@ -775,6 +878,27 @@ Thread model: posix'''), '21.9.0')
                 self.assertEqual(qcc.get_preprocess_only_args(), ['-E', '-Wp,-P'])
                 # get_preprocess_to_file_args() builds on get_preprocess_only_args().
                 self.assertEqual(qcc.get_preprocess_to_file_args(), ['-E', '-Wp,-P', suffix])
+
+    def test_pkgconfig_define_feature_validator(self):
+        # One pair is a flat list of two strings, and needs no newer Meson.
+        self.assertEqual(list(_pkgconfig_define_feature_validator([])), [])
+        self.assertEqual(list(_pkgconfig_define_feature_validator(['prefix', '/tmp'])), [])
+        self.assertEqual(len(list(_pkgconfig_define_feature_validator(['prefix', '/tmp', 'libdir', '/x']))), 1)
+
+    def test_dirmaker_makedirs_raises_on_file_conflict(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a file where makedirs later expects a directory.
+            conflict = os.path.join(tmpdir, 'bin', 'p11-kit')
+            os.makedirs(os.path.join(tmpdir, 'bin'))
+            with open(conflict, 'w') as f:
+                f.write('')
+            dm = DirMaker(open(os.devnull, 'w'), os.makedirs)
+            # Trying to treat the file as a directory must raise a MesonException
+            # rather than the cryptic FileExistsError from os.makedirs.
+            with self.assertRaises(MesonException) as ctx:
+                dm.makedirs(os.path.join(tmpdir, 'bin', 'p11-kit', 'sub'), exist_ok=True)
+            self.assertIn('p11-kit', str(ctx.exception))
 
     def test_qcc_unsupported_features_raise(self):
         # qcc/q++ have no alternate-linker-selection equivalent, so Meson
@@ -2671,6 +2795,31 @@ Thread model: posix'''), '21.9.0')
 
         with self.assertRaises(InvalidArguments):
             _(None, mock.Mock(), [], {'install_mode': ['rw-rw-r--', True]})
+
+    def test_compute_clang_cl_tool_name(self) -> None:
+        from mesonbuild.compilers.detect import compute_clang_cl_tool_name
+
+        cases = [
+            ('clang-cl', 'llvm-lib', 'llvm-lib'),
+            ('clang-cl.exe', 'llvm-lib', 'llvm-lib.exe'),
+            ('x86_64-pc-windows-msvc-clang-cl', 'llvm-lib',
+             'x86_64-pc-windows-msvc-llvm-lib'),
+            ('x86_64-pc-windows-msvc-clang-cl.exe', 'lld-link',
+             'x86_64-pc-windows-msvc-lld-link.exe'),
+            (os.path.join('tools', 'clang-cl'), 'lld-link',
+             os.path.join('tools', 'lld-link')),
+            (os.path.join('tools', 'target-clang-cl.exe'), 'llvm-lib',
+             os.path.join('tools', 'target-llvm-lib.exe')),
+            ('CLANG-CL.EXE', 'lld-link', 'lld-link.EXE'),
+            ('cl', 'llvm-lib', None),
+            ('clang', 'lld-link', None),
+            ('notclang-cl', 'lld-link', None),
+            ('clang-clxexe', 'lld-link', None),
+            ('target-clang-cl-extra', 'llvm-lib', None),
+        ]
+        for driver, tool, expected in cases:
+            with self.subTest(driver=driver, tool=tool):
+                self.assertEqual(compute_clang_cl_tool_name([driver], tool), expected)
 
     def test_detect_cpu_family(self) -> None:
         """Test the various cpu families that we detect and normalize.

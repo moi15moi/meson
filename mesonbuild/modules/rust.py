@@ -296,7 +296,7 @@ class RustCrate(ModuleObject):
     @TypedArgs('rust_crate.env')
     def env_method(self, state: ModuleState, args: T.List, kwargs: TYPE_kwargs) -> T.Dict[str, str]:
         """Returns environment variables for this package."""
-        return self.package.get_env_dict(state.environment, state.subdir)
+        return self.package.get_env_dict(state.environment, state.subdir, state.current_build_dir)
 
     @TypedArgs('rust_crate.rust_dependency_map')
     def rust_dependency_map_method(self, state: ModuleState, args: T.List, kwargs: TYPE_kwargs) -> T.Dict[str, str]:
@@ -327,7 +327,7 @@ class RustPackage(RustCrate):
         cfg = self.package.cfg[for_machine]
 
         if kwargs['dependencies']:
-            for dep_key, dep_pkg in cfg.dep_packages.items():
+            for dep_pkg in cfg.dep_packages.values():
                 if dep_pkg.manifest.lib:
                     # Get the dependency name for this package (rust or proc-macro ABI)
                     depname = dep_pkg.get_rust_dependency_name()

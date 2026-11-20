@@ -360,6 +360,7 @@ class AstInterpreter(InterpreterBase):
                 args: mparser.ArgumentNode,
                 key_resolver: T.Callable[[mparser.BaseNode], str] = default_resolve_key,
                 duplicate_key_error: T.Optional[str] = None,
+                expand_default_kwargs: bool = False,
             ) -> T.Tuple[T.List[TYPE_ivar], TYPE_nkwargs]:
         for arg in args.arguments:
             self.evaluate_statement(arg)
@@ -370,6 +371,7 @@ class AstInterpreter(InterpreterBase):
             kwargs[key_resolver(key)] = val
         if args.incorrect_order():
             raise InvalidArguments('All keyword arguments must be after positional arguments.')
+        # TODO: handle expand_default_kwargs
         return self.flatten_args(args.arguments), kwargs
 
     def evaluate_comparison(self, node: ComparisonNode) -> None:
@@ -810,7 +812,7 @@ class AstInterpreter(InterpreterBase):
         if hasattr(cur, 'args'):
             for arg in cur.args.arguments:
                 self.dataflow_dag.add_edge(arg, cur)
-            for k, v in cur.args.kwargs.items():
+            for v in cur.args.kwargs.values():
                 self.dataflow_dag.add_edge(v, cur)
         for attr in ['source_object', 'left', 'right', 'items', 'iobject', 'index', 'condition']:
             if hasattr(cur, attr):

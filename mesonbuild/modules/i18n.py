@@ -246,10 +246,10 @@ class XgettextProgram:
         if estimated_cmdline_length < mesonlib.get_rsp_threshold():
             return None
 
-        rsp_file = Path(self.interpreter.environment.build_dir, self.interpreter.subdir, name+'.rsp')
+        rsp_file = Path(self.interpreter.environment.build_dir, self.interpreter.current_build_dir(), name+'.rsp')
         rsp_file.write_text(source_list, encoding='utf-8')
 
-        return mesonlib.File.from_built_file(self.interpreter.subdir, rsp_file.name)
+        return mesonlib.File.from_built_file(self.interpreter.current_build_dir(), rsp_file.name)
 
     @staticmethod
     def _get_source_id(sources: T.Iterable[SourcesType]) -> T.Iterable[str]:
@@ -509,9 +509,7 @@ class I18nModule(ExtensionModule):
         mo_targets = kwargs['mo_targets']
         its_files = kwargs.get('its_files', [])
 
-        mo_fnames = []
-        for target in mo_targets:
-            mo_fnames.append(path.join(target.get_builddir(), target.get_outputs()[0]))
+        mo_fnames = [path.join(target.get_builddir(), target.get_outputs()[0]) for target in mo_targets]
 
         command: T.List[CommandTypes] = []
         command.extend(state.environment.get_build_command())

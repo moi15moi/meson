@@ -706,7 +706,8 @@ class ConverterCustomTarget:
                 target = output_target_map.executable(j)
                 if target:
                     # When cross compiling, binaries have to be executed with an exe_wrapper (for instance wine for mingw-w64)
-                    if self.env.exe_wrapper is not None and self.env.properties[self.for_machine].get_cmake_use_exe_wrapper():
+                    if not self.env.can_run_binaries(self.for_machine) and \
+                            self.env.properties[self.for_machine].get_cmake_use_exe_wrapper():
                         assert isinstance(self.env.exe_wrapper, ExternalProgram)
                         cmd += self.env.exe_wrapper.get_command()
                     cmd += [target]
@@ -795,10 +796,11 @@ class ConverterCustomTarget:
         mlog.log('  -- depends:      ', mlog.bold(str(self.depends)))
 
 class CMakeInterpreter:
-    def __init__(self, subdir: Path, env: 'Environment', backend: 'Backend', for_machine: MachineChoice):
-        self.subdir = subdir
-        self.src_dir = Path(env.get_source_dir(), subdir)
-        self.build_dir_rel = subdir / '__CMake_build'
+    def __init__(self, subdir: str, env: 'Environment', backend: 'Backend', for_machine: MachineChoice):
+        self.subdir = Path(subdir)
+        prefix = for_machine.get_prefix()
+        self.build_dir_rel = Path(prefix + subdir) / '__CMake_build'
+        self.src_dir = Path(env.get_source_dir()) / subdir
         self.build_dir = Path(env.get_build_dir()) / self.build_dir_rel
         self.install_prefix = Path(T.cast('str', env.coredata.optstore.get_value_for(OptionKey('prefix'))))
         self.env = env

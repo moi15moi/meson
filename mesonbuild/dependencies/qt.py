@@ -43,15 +43,6 @@ def _qt_get_private_includes(mod_inc_dir: str, module: str, mod_version: str) ->
         return []
 
     private_dir = os.path.join(mod_inc_dir, mod_version)
-    # fallback, let's try to find a directory with the latest version
-    if os.path.isdir(mod_inc_dir) and not os.path.exists(private_dir):
-        dirs = [filename for filename in os.listdir(mod_inc_dir)
-                if os.path.isdir(os.path.join(mod_inc_dir, filename))]
-
-        for dirname in sorted(dirs, reverse=True):
-            if len(dirname.split('.')) == 3:
-                private_dir = dirname
-                break
     return [private_dir, mesonlib.as_posix(private_dir, f'Qt{module}')]
 
 
@@ -197,7 +188,7 @@ class QtPkgConfigDependency(_QtBase, PkgConfigDependency, metaclass=mesonlib.Sim
                 qt_inc_dir = mod.get_variable(pkgconfig='includedir')
                 qt_inc_dir = self.env.get_sys_root_path(self.for_machine, qt_inc_dir)
                 mod_private_dir = os.path.join(qt_inc_dir, 'Qt' + m)
-                if not os.path.isdir(mod_private_dir):
+                if not os.path.isdir(os.path.join(mod_private_dir, mod.version)):
                     if self.env.machines[self.for_machine].is_darwin():
                         # On macOS Qt is conventionally shipped as a framework
                         # (e.g. Homebrew's qt@6). pkg-config 'includedir' is

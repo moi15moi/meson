@@ -12,7 +12,7 @@ import typing as T
 
 from mesonbuild.ast import IntrospectionInterpreter, AstIDGenerator
 from mesonbuild.ast.printer import RawPrinter
-from mesonbuild.mesonlib import windows_proof_rmtree, is_windows, is_linux
+from mesonbuild.mesonlib import windows_proof_rmtree
 
 from .baseplatformtests import BasePlatformTests
 from .helpers import skip_if_not_language
@@ -262,9 +262,9 @@ class RewriterTests(BasePlatformTests):
                 }
             }
         }
-        for k1, v1 in expected.items():
-            for k2, v2 in v1.items():
-                for k3, v3 in v2.items():
+        for v1 in expected.values():
+            for v2 in v1.values():
+                for v3 in v2.values():
                     if isinstance(v3, list):
                         for i in range(len(v3)):
                             v3[i] = v3[i].replace('/', os.path.sep)

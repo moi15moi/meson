@@ -20,6 +20,8 @@ import subprocess
 import typing as T
 
 from . import backends
+from .backends import CleanTrees
+from .rspfile import RSPFileSyntax, rsp_file_flag, rsp_quote_func
 from .. import modules
 from .. import mesonlib
 from .. import build
@@ -28,14 +30,13 @@ from .. import compilers
 from .. import tooldetect
 from ..arglist import CompilerArgs
 from ..compilers import Compiler, is_library
-from ..linkers import ArLikeLinker, RSPFileSyntax, StaticLinker
+from ..linkers import ArLikeLinker, StaticLinker, VisualStudioLikeLinkerMixin
 from ..mesonlib import (
     File, LibType, MachineChoice, MesonBugException, MesonException, OrderedSet, PerMachine,
-    ProgressBar, quote_arg, unique_list
+    ProgressBar, quote_arg, unique_list, cmd_quote
 )
 from ..mesonlib import as_posix, get_compiler_for_source, has_path_sep, is_parent_path, lookbehind, path_has_root
 from ..options import OptionKey
-from .backends import CleanTrees
 from ..build import GeneratedList, InvalidArguments
 
 if T.TYPE_CHECKING:
@@ -45,6 +46,7 @@ if T.TYPE_CHECKING:
     from ..compilers.compilers import Language
     from ..compilers.cs import CsCompiler
     from ..compilers.fortran import FortranCompiler
+    from ..compilers.mixins.visualstudio import MSVCCompiler
     from ..compilers.rust import RustCompiler
     from ..compilers.swift import SwiftCompiler
     from ..mesonlib import FileOrString
@@ -66,19 +68,6 @@ FORTRAN_MODULE_PAT = r"^\s*\bmodule\b\s+(\w+)\s*(?:!+.*)*$"
 FORTRAN_SUBMOD_PAT = r"^\s*\bsubmodule\b\s*\((\w+:?\w+)\)\s*(\w+)"
 FORTRAN_USE_PAT = r"^\s*use,?\s*(?:non_intrinsic)?\s*(?:::)?\s*(\w+)"
 
-def cmd_quote(arg: str) -> str:
-    # see: https://docs.microsoft.com/en-us/windows/desktop/api/shellapi/nf-shellapi-commandlinetoargvw#remarks
-
-    # backslash escape any existing double quotes
-    # any existing backslashes preceding a quote are doubled
-    arg = re.sub(r'(\\*)"', lambda m: '\\' * (len(m.group(1)) * 2 + 1) + '"', arg)
-    # any terminal backslashes likewise need doubling
-    arg = re.sub(r'(\\*)$', lambda m: '\\' * (len(m.group(1)) * 2), arg)
-    # and double quote
-    arg = f'"{arg}"'
-
-    return arg
-
 # How ninja executes command lines differs between Unix and Windows
 # (see https://ninja-build.org/manual.html#ref_rule_command)
 if mesonlib.is_windows():
@@ -89,16 +78,6 @@ else:
     quote_func = quote_arg
     execute_wrapper = []
     rmfile_prefix = ['rm', '-f', '{}', '&&']
-
-def gcc_rsp_quote(s: str) -> str:
-    # see: the function buildargv() in libiberty
-    #
-    # this differs from sh-quoting in that a backslash *always* escapes the
-    # following character, even inside single quotes.
-
-    s = s.replace('\\', '\\\\')
-
-    return quote_func(s)
 
 # a conservative estimate of the command-line length limit
 rsp_threshold = mesonlib.get_rsp_threshold()
@@ -236,12 +215,9 @@ class NinjaRule:
 
     def write(self, outfile: T.TextIO) -> None:
         rspfile_args = self.args
-        rspfile_quote_func: T.Callable[[str], str]
+        rspfile_quote_func = rsp_quote_func(self.rspfile_quote_style)
         if self.rspfile_quote_style in {RSPFileSyntax.MSVC, RSPFileSyntax.TASKING}:
-            rspfile_quote_func = cmd_quote
             rspfile_args = [NinjaCommandArg('$in_newline', arg.quoting) if arg.s == '$in' else arg for arg in rspfile_args]
-        else:
-            rspfile_quote_func = gcc_rsp_quote
 
         def rule_iter() -> T.Iterable[str]:
             if self.refcount:
@@ -252,10 +228,8 @@ class NinjaRule:
         for rsp in rule_iter():
             outfile.write(f'rule {self.name}{rsp}\n')
             if rsp == '_RSP':
-                if self.rspfile_quote_style is RSPFileSyntax.TASKING:
-                    outfile.write(' command = {} --option-file=$out.rsp\n'.format(' '.join([self._quoter(x) for x in self.command])))
-                else:
-                    outfile.write(' command = {} @$out.rsp\n'.format(' '.join([self._quoter(x) for x in self.command])))
+                command = ' '.join([self._quoter(x) for x in self.command])
+                outfile.write(f' command = {command} {rsp_file_flag(self.rspfile_quote_style)}$out.rsp\n')
                 outfile.write(' rspfile = $out.rsp\n')
                 outfile.write(' rspfile_content = {}\n'.format(' '.join([self._quoter(x, rspfile_quote_func) for x in rspfile_args])))
             else:
@@ -418,10 +392,7 @@ class NinjaBuildElement:
         outfile.write(line)
 
         if use_rspfile:
-            if self.rule.rspfile_quote_style in {RSPFileSyntax.MSVC, RSPFileSyntax.TASKING}:
-                qf = cmd_quote
-            else:
-                qf = gcc_rsp_quote
+            qf = rsp_quote_func(self.rule.rspfile_quote_style)
         else:
             qf = quote_func
 
@@ -586,7 +557,8 @@ class NinjaBackend(backends.Backend):
         # - https://github.com/mesonbuild/meson/pull/9453
         # - https://github.com/mesonbuild/meson/issues/9479#issuecomment-953485040
         self.allow_thin_archives = PerMachine[bool](True, True)
-        self.import_std: T.Optional[ImportStdInfo] = None
+        # The compiled standard library modules, by file name
+        self.import_std: T.Dict[str, ImportStdInfo] = {}
 
     def create_phony_target(self, dummy_outfile: str, rulename: str, phony_infilenames: ListifiedStr) -> NinjaBuildElement:
         '''
@@ -843,9 +815,8 @@ class NinjaBackend(backends.Backend):
         for genlist in target.get_generated_sources():
             if isinstance(genlist, (build.CustomTarget, build.CustomTargetIndex)):
                 continue
-            for src in genlist.get_outputs():
-                if compilers.is_header(src):
-                    header_deps.append(self.get_target_generated_dir(target, genlist, src))
+            header_deps.extend(self.get_target_generated_dir(target, genlist, src)
+                               for src in genlist.get_outputs() if compilers.is_header(src))
         if target.vala_header:
             vala_header = File.from_built_file(self.get_target_dir(target), target.vala_header)
             header_deps.append(vala_header)
@@ -1327,7 +1298,7 @@ class NinjaBackend(backends.Backend):
                                                 capture=ofilenames[0] if target.capture else None,
                                                 feed=srcs[0] if target.feed else None,
                                                 env=target.env,
-                                                can_use_rsp_file=target.rspable,
+                                                rsp_syntax=target.rsp_syntax,
                                                 verbose=target.console)
         if reason:
             cmd_type = f' (wrapped by meson {reason})'
@@ -1349,7 +1320,7 @@ class NinjaBackend(backends.Backend):
 
     def build_run_target_name(self, target: build.RunTarget) -> str:
         if target.subproject != '':
-            subproject_prefix = f'{target.subproject}@@'
+            subproject_prefix = f'{target.build_project.prefix}{target.subproject}@@'
         else:
             subproject_prefix = ''
         return f'{subproject_prefix}{target.name}'
@@ -1654,9 +1625,7 @@ class NinjaBackend(backends.Backend):
     def generate_java_compile(self, srcs: T.List[File], target: build.BuildTarget, compiler: Compiler, args: T.List[str]) -> T.List[str]:
         deps = [os.path.join(self.get_target_dir(l), l.get_filename()) for l in target.link_targets]
         generated_sources = self.get_target_generated_sources(target)
-        for rel_src in generated_sources:
-            if rel_src.endswith('.java'):
-                deps.append(rel_src)
+        deps.extend(rel_src for rel_src in generated_sources if rel_src.endswith('.java'))
 
         rel_srcs = []
         plain_class_paths = []
@@ -2130,8 +2099,16 @@ class NinjaBackend(backends.Backend):
         deps: T.List[str] = []
         project_deps: T.List[RustDep] = []
         args: T.List[str] = []
+        linked_deps: T.Set[str] = set()
 
         def _link_library(libname: str, static: bool, bundle: bool = False) -> None:
+            # rustc will fail with "overriding link modifiers from
+            # command line is not supported" if a modifier is applied
+            # and the library appears more than once
+            if libname in linked_deps:
+                return
+            linked_deps.add(libname)
+
             orig_libname = libname
             type_ = 'static' if static else 'dylib'
             modifiers = []
@@ -2216,6 +2193,19 @@ class NinjaBackend(backends.Backend):
                 elif a.startswith('-L'):
                     args.append(a)
                     continue
+                elif a.startswith('-l') and isinstance(rustc.linker, VisualStudioLikeLinkerMixin):
+                    # The MSVC linker does not support -l, and rustc does not go
+                    # through a conversion path like unix_args_to_native(), so don't
+                    # use -Clink-arg= in that case; pass the option to rustc so that
+                    # it is looked up and converted.  Do not do it for POSIX linkers
+                    # because rustc reorders libraries, and this breaks GNU ld which
+                    # resolves symbols left to right.
+                    if a.startswith('-l:'):
+                        static = a.endswith(('.a', '.lib'))
+                        _link_library(a[3:], static)
+                    else:
+                        args.append(a)
+                    continue
                 elif a.startswith('-F'):
                     path = a[2:]
                     args.append(f'-Lframework={path}')
@@ -2271,7 +2261,14 @@ class NinjaBackend(backends.Backend):
         if has_rust_shared_deps:
             args += ['-C', 'prefer-dynamic']
         if has_shared_deps or has_rust_shared_deps:
-            args += self.get_build_rpath_args(target, rustc)
+            # rustc's sysroot is only needed to find Rust dylibs (and a
+            # dynamically linked libstd) from rustup installations. A program
+            # that links libstd statically must not carry the toolchain's
+            # library directory in its runpath, and the entry also cannot be
+            # removed at install time, which makes 'meson install' fail when
+            # install_rpath is longer than the build-time rpath.
+            extra_paths = [rustc.get_target_libdir()] if has_rust_shared_deps else None
+            args += self.get_build_rpath_args(target, rustc, extra_paths)
 
         return deps, project_deps, args
 
@@ -2356,17 +2353,12 @@ class NinjaBackend(backends.Backend):
         return result
 
     def get_swift_link_deps(self, target: build.BuildTarget) -> T.List[str]:
-        result = []
-        for l in target.link_targets:
-            result.append(self.get_target_filename(l))
-        return result
+        return [self.get_target_filename(l) for l in target.link_targets]
 
     def split_swift_generated_sources(self, target: build.BuildTarget) -> T.List[str]:
         all_srcs = self.get_target_generated_sources(target)
         srcs: T.List[str] = []
-        for i in all_srcs:
-            if i.endswith('.swift'):
-                srcs.append(i)
+        srcs.extend(i for i in all_srcs if i.endswith('.swift'))
         return srcs
 
     def generate_swift_target(self, target: build.BuildTarget) -> None:
@@ -2561,6 +2553,8 @@ class NinjaBackend(backends.Backend):
                     pool = None
 
                 options = self._rsp_options(compiler)
+                if options['rspable']:
+                    options['rspfile_quote_style'] = compiler.linker_rsp_file_syntax()
                 self.add_rule(NinjaRule(rule, command, args, description, **options, extra=pool))
             if self.environment.machines[for_machine].is_aix() and complist:
                 rule = 'AIX_LINKER{}'.format(self.get_rule_suffix(for_machine))
@@ -3098,19 +3092,20 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
         return (rel_obj, rel_src)
 
     @lru_cache(maxsize=None)
-    def generate_inc_dir(self, compiler: 'Compiler', d: str, basedir: str, is_system: bool
+    def generate_inc_dir(self, compiler: Compiler, d: str, inc_dir: build.IncludeDirs
                          ) -> T.Tuple[ImmutableListProtocol[str], ImmutableListProtocol[str]]:
-        expdir = os.path.normpath(os.path.join(basedir, d))
+        expdir = os.path.join(inc_dir.curdir, d)
         srctreedir = os.path.normpath(os.path.join(self.build_to_src, expdir))
-        sargs = compiler.get_include_args(srctreedir, is_system)
+        sargs = compiler.get_include_args(srctreedir, inc_dir.is_system)
         # There may be include dirs where a build directory has not been
         # created for some source dir. For example if someone does this:
         #
         # inc = include_directories('foo/bar/baz')
         #
         # But never subdir()s into the actual dir.
-        if os.path.isdir(os.path.join(self.environment.get_build_dir(), expdir)):
-            bargs = compiler.get_include_args(expdir, is_system)
+        build_subdir = os.path.normpath(inc_dir.build_project.prefix + expdir)
+        if os.path.isdir(os.path.join(self.environment.get_build_dir(), build_subdir)):
+            bargs = compiler.get_include_args(build_subdir, inc_dir.is_system)
         else:
             bargs = []
         return (sargs, bargs)
@@ -3140,7 +3135,6 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
         # external deps and must maintain the order in which they are specified.
         # Hence, we must reverse the list so that the order is preserved.
         for i in reversed(target.get_include_dirs()):
-            basedir = i.curdir
             # Each directory must be added to CompilerArgs individually
             # via a separate ``commands +=`` call, in reversed order.
             #
@@ -3165,11 +3159,11 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
             # appended at once in the original (unreversed) order, making
             # the *first*-listed directory appear first instead of last.
             for d in reversed(i.incdirs):
-                sargs, bargs = self.generate_inc_dir(compiler, d, basedir, i.is_system)
+                sargs, bargs = self.generate_inc_dir(compiler, d, i)
                 commands += sargs
                 commands += bargs
             for d in i.extra_build_dirs:
-                commands += compiler.get_include_args(d, i.is_system)
+                commands += compiler.get_include_args(os.path.normpath(os.path.join(i.curdir, d)), i.is_system)
 
         # Add any embed search dir arguments
         for i in target.embed_dirs:
@@ -3400,9 +3394,7 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
             element.rulename = 'CUSTOM_COMMAND'
             meson_exe_cmd, reason = self.as_meson_exe_cmdline(exe[0],
                                                               exe[1:] + commands.to_native(),
-                                                              separator='\n',
-                                                              rsp_file_flag='-@',
-                                                              can_use_rsp_file=True,
+                                                              rsp_syntax=RSPFileSyntax.NASM,
                                                               verbose=True)
             cmd_type = f' (wrapped by meson {reason})' if reason else ''
             element.add_item('COMMAND', meson_exe_cmd)
@@ -3433,9 +3425,9 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
         # At the time of writing, all three major compilers work
         # wildly differently. Keep this isolated here until things
         # consolidate.
+        mod_file = self.get_import_std_module_file(target, compiler)
         if compiler.id == 'gcc':
-            if self.import_std is None:
-                mod_file = 'gcm.cache/std.gcm'
+            if mod_file not in self.import_std:
                 mod_obj_file = 'std.o'
                 elem = NinjaBuildElement(self.all_outputs, [mod_file, mod_obj_file], 'CUSTOM_COMMAND', [])
                 compile_args = compiler.get_option_compile_args(target, target.subproject)
@@ -3443,29 +3435,38 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
                 compile_args += ['-c', '-fmodules', '-fsearch-include-path', 'bits/std.cc']
                 elem.add_item('COMMAND', compiler.exelist + compile_args)
                 self.add_build(elem)
-                self.import_std = ImportStdInfo(elem, mod_file, [mod_obj_file])
+                self.import_std[mod_file] = ImportStdInfo(elem, mod_file, [mod_obj_file])
             istd_args = ['-fmodules']
-            istd_dep = [File(True, '', self.import_std.gen_module_file)]
+            istd_dep = [File.from_built_file('', self.import_std[mod_file].gen_module_file)]
             return istd_args, istd_dep
         elif compiler.id == 'msvc':
-            if self.import_std is None:
-                mod_file = 'std.ifc'
-                mod_obj_file = 'std.obj'
+            msvc = T.cast('MSVCCompiler', compiler)
+            # There is a module for each set of arguments which matter to the importers.
+            mod_obj_file = os.path.splitext(mod_file)[0] + '.obj'
+            if mod_file not in self.import_std:
                 in_file = Path(os.environ['VCToolsInstallDir']) / 'modules/std.ixx'
                 if not in_file.is_file():
-                    raise SystemExit('VS std import header could not be located.')
+                    raise MesonException('VS std import header could not be located.')
                 in_file_str = str(in_file)
                 elem = NinjaBuildElement(self.all_outputs, [mod_file, mod_obj_file], 'CUSTOM_COMMAND', [in_file_str])
-                compile_args = compiler.get_option_compile_args(target, target.subproject)
-                compile_args += compiler.get_option_std_args(target, target.subproject)
-                compile_args += ['/nologo', '/c', '/O2', in_file_str]
-                elem.add_item('COMMAND', compiler.exelist + compile_args)
+                compile_args = msvc.get_import_std_args(self._generate_single_compile(target, compiler).to_native())
+                # There is nothing to gain from a compiler cache, it can not restore the module
+                elem.add_item('COMMAND', [*msvc.get_exelist(ccache=False), *compile_args, '/nologo', '/c',
+                                          '/ifcOutput', mod_file, f'/Fo{mod_obj_file}', in_file_str])
                 self.add_build(elem)
-                self.import_std = ImportStdInfo(elem, mod_file, [mod_obj_file])
-            istd_dep = [File(True, '', self.import_std.gen_module_file)]
+                self.import_std[mod_file] = ImportStdInfo(elem, mod_file, [mod_obj_file])
+            istd_args = ['/reference', f'std={mod_file}']
+            istd_dep = [File.from_built_file('', self.import_std[mod_file].gen_module_file)]
             return istd_args, istd_dep
         else:
             raise MesonException(f'Import std not supported on compiler {compiler.id} yet.')
+
+    def get_import_std_module_file(self, target: build.BuildTarget, compiler: Compiler) -> str:
+        """The compiled standard library module a target imports"""
+        if compiler.id == 'msvc':
+            args = self._generate_single_compile(target, compiler).to_native()
+            return f'std.{T.cast("MSVCCompiler", compiler).get_import_std_id(args)}.ifc'
+        return 'gcm.cache/std.gcm'
 
     def add_dependency_scanner_entries_to_element(self, target: build.BuildTarget, compiler: Compiler, element: NinjaBuildElement, src: File) -> None:
         if not self.should_use_dyndeps_for_target(target):
@@ -3552,6 +3553,7 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
             # Explicitly compile pch headers as C++. If Clang is invoked in C++ mode, it actually warns if
             # this option is not set, and for gcc it also makes sense to use it.
             commands += ['-x', 'c++-header']
+        commands += compiler.get_pch_create_args()
         dst = os.path.join(self.get_target_private_dir(target),
                            os.path.basename(pch) + '.' + compiler.get_pch_suffix())
         dep = dst + '.' + compiler.get_depfile_suffix()
@@ -3809,7 +3811,8 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
         self.add_build(elem)
         return obj_list
 
-    def get_build_rpath_args(self, target: build.BuildTarget, linker: T.Union[Compiler, StaticLinker]) -> T.List[str]:
+    def get_build_rpath_args(self, target: build.BuildTarget, linker: T.Union[Compiler, StaticLinker],
+                             extra_paths: T.Optional[T.List[str]] = None) -> T.List[str]:
         if has_path_sep(target.name):
             # Target names really should not have slashes in them, but
             # unfortunately we did not check for that and some downstream projects
@@ -3821,7 +3824,7 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
         (rpath_args, target.rpath_dirs_to_remove) = (
             linker.build_rpath_args(self.environment.get_build_dir(),
                                     target_slashname_workaround_dir,
-                                    target))
+                                    target, extra_paths))
         return rpath_args
 
     def generate_link(self, target: build.BuildTarget, outname: str, obj_list: T.List[str],
@@ -3990,7 +3993,7 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
     def get_import_std_object(self, target: build.BuildTarget) -> T.List[str]:
         if not self.target_uses_import_std(target):
             return []
-        return self.import_std.gen_objects
+        return self.import_std[self.get_import_std_module_file(target, target.compilers['cpp'])].gen_objects
 
     def get_dependency_filename(self, t: T.Union[File, build.BuildTargetProto]) -> str:
         if isinstance(t, build.SharedLibrary):
@@ -4234,12 +4237,11 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
         # instead of files. This is needed because on platforms other than
         # Windows, Ninja only deletes directories while cleaning if they are
         # empty. https://github.com/mesonbuild/meson/issues/1220
-        ctlist = []
+        ctlist: list[str] = []
         for t in self.build.get_targets().values():
             if isinstance(t, build.CustomTarget):
                 # Create a list of all custom target outputs
-                for o in t.get_outputs():
-                    ctlist.append(os.path.join(self.get_target_dir(t), o))
+                ctlist.extend(os.path.join(self.get_target_dir(t), o) for o in t.get_outputs())
         # Also clean meson-dist directory created by `meson dist`
         ctlist.append('meson-dist')
         if ctlist:

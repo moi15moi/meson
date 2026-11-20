@@ -19,7 +19,6 @@ from mesonbuild.mesonlib import (
     MachineChoice, is_windows, is_cygwin, python_command, version_compare,
     EnvironmentException
 )
-from mesonbuild.options import OptionKey
 from mesonbuild.compilers import (
     detect_c_compiler, detect_d_compiler, compiler_from_language,
 )
@@ -446,6 +445,34 @@ class WindowsTests(BasePlatformTests):
             raise SkipTest('C++ modules are only supported with VS 2019 Preview or newer.')
         self.init(os.path.join(self.unit_test_dir, '85 cpp modules'))
         self.build()
+
+    def test_import_std_arguments(self):
+        if self.backend is not Backend.ninja:
+            raise SkipTest(f'import std only works with the Ninja backend (not {self.backend.name}).')
+        if 'VSCMD_VER' not in os.environ or 'VCToolsInstallDir' not in os.environ:
+            raise SkipTest('import std is only supported with Visual Studio.')
+        if version_compare(os.environ['VSCMD_VER'], '<17.14.0'):
+            raise SkipTest('import std requires Visual Studio 2022 17.14 or newer.')
+        self.init(os.path.join(self.unit_test_dir, '142 importstd flags'))
+        self.build()
+        self.run_tests()
+        # One standard library module for the two C runtimes
+        with open(os.path.join(self.builddir, 'build.ninja'), encoding='utf-8') as f:
+            modules = re.findall(r'^build (std\.\w+\.ifc) ', f.read(), re.MULTILINE)
+        self.assertEqual(len(modules), 2, modules)
+
+    def test_import_std_missing_header(self):
+        if self.backend is not Backend.ninja:
+            raise SkipTest(f'import std only works with the Ninja backend (not {self.backend.name}).')
+        if 'VSCMD_VER' not in os.environ or 'VCToolsInstallDir' not in os.environ:
+            raise SkipTest('import std is only supported with Visual Studio.')
+        if version_compare(os.environ['VSCMD_VER'], '<17.14.0'):
+            raise SkipTest('import std requires Visual Studio 2022 17.14 or newer.')
+        # Point the VS install at a directory without modules/std.ixx
+        env = {'VCToolsInstallDir': os.path.join(self.builddir, 'no-vc-install')}
+        out = self.init(os.path.join(self.unit_test_dir, '142 importstd flags'),
+                        override_envvars=env, allow_fail=True)
+        self.assertIn('VS std import header could not be located.', out)
 
     def test_non_utf8_fails(self):
         # FIXME: VS backend does not use flags from compiler.get_always_args()

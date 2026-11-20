@@ -8,20 +8,21 @@ import os
 import pickle
 import subprocess
 import tempfile
-import subprocess
 import textwrap
 import shutil
-from unittest import skipIf, SkipTest
+import sys
+from unittest import mock, skipIf, SkipTest
 from pathlib import Path
 
 from .baseplatformtests import BasePlatformTests
-from .helpers import skip_if_not_language, IS_CI
+from .helpers import skip_if_not_language, skip_if_no_cmake, IS_CI
 from mesonbuild.mesonlib import EnvironmentVariables, ExecutableSerialisation, MesonException, is_linux, python_command, windows_proof_rmtree
 from mesonbuild.mformat import Formatter, match_path
 from mesonbuild.interpreterbase import InvalidArguments
 from mesonbuild.optinterpreter import OptionInterpreter, OptionException
 from mesonbuild.options import OptionStore
 from run_tests import Backend
+import mesonbuild.build
 
 @skipIf(IS_CI and not is_linux(), "Run only on fast platforms")
 class PlatformAgnosticTests(BasePlatformTests):
@@ -112,6 +113,18 @@ class PlatformAgnosticTests(BasePlatformTests):
                         self.assertIn(('--target-glib', run['expected']), zip(src['parameters'], src['parameters'][1:]))
             except FileNotFoundError:
                 self.skipTest('Current backend does not produce introspection data')
+
+    def test_dependency_extra_files_introspection(self):
+        '''
+        Test that extra_files of an internal dependency are exposed together with the target's own.
+        https://github.com/mesonbuild/meson/issues/15863
+        '''
+        testdir = os.path.join(self.unit_test_dir, '144 dependency extra files')
+        self.init(testdir)
+        targets = self.introspect('--targets')
+        self.assertEqual(len(targets), 1)
+        names = sorted(os.path.basename(f) for f in targets[0]['extra_files'])
+        self.assertEqual(names, ['dep.txt', 'own.txt'])
 
     def test_debug_function_outputs_to_meson_log(self):
         testdir = os.path.join(self.unit_test_dir, '104 debug function')
@@ -318,6 +331,20 @@ class PlatformAgnosticTests(BasePlatformTests):
         out = self.init(testdir, allow_fail=True)
         self.assertNotIn('Unhandled python exception', out)
 
+    @skip_if_no_cmake
+    def test_cmake_native_subproject_ctgt(self):
+        """Issue #16314"""
+        testdir = os.path.join(self.unit_test_dir, '143 cmake native subproject ctgt')
+        wrapper = os.path.join(testdir, 'wrapper.py')
+        with tempfile.TemporaryDirectory() as d:
+            overlay = os.path.join(d, 'wrapper.txt')
+            with open(overlay, 'w', encoding='utf-8') as f:
+                f.write(f"[binaries]\nexe_wrapper = {[sys.executable, wrapper]!r}\n")
+            self.meson_cross_files = [os.path.join(self.src_root, 'cross', 'linux-mingw-w64-64bit.txt'),
+                                      overlay]
+            self.init(testdir)
+            self.build()
+
     def test_editorconfig_match_path(self):
         '''match_path function used to parse editorconfig in meson format'''
         cases = [
@@ -413,6 +440,101 @@ class PlatformAgnosticTests(BasePlatformTests):
         code = 'a = {\n    # comment\n}\n'
         formatted = formatter.format(code, Path())
         self.assertEqual(code, formatted)
+
+    def test_format_sticky_parens(self) -> None:
+        fd, fname = tempfile.mkstemp(suffix='.ini', text=True)
+        self.addCleanup(os.unlink, fname)
+
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write("sticky_parens = true\nindent_by = '  '\nend_of_line = lf\n")
+
+        formatter = Formatter(Path(fname), use_editor_config=False, fetch_subdirs=False)
+        cases = [
+            ('if (\n  a\n  or b\n)\n  x = 1\nendif\n',
+             'if (a\n    or b)\n  x = 1\nendif\n'),
+            ('if (a or  # comment\n    b)\n  x = 1\nendif\n',
+             'if (a\n    or  # comment\n    b)\n  x = 1\nendif\n'),
+            ('x = (  # comment\n  a or b)\n',
+             'x = (  # comment\n    a\n    or b)\n'),
+            ('x = ((aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa or bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb) and ccccccccccccccc)\n',
+             'x = ((aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa or bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)\n    and ccccccccccccccc)\n'),
+            ("x = (a.get_variable(cmake: 'LLVM_ENABLE_RTTI') == 'ON') == (b.get_variable(configtool: 'has-rtti') == 'YES')\n",
+             "x = (a.get_variable(cmake: 'LLVM_ENABLE_RTTI') == 'ON') == (b.get_variable(\n  configtool: 'has-rtti',\n) == 'YES')\n"),
+        ]
+        for code, expected in cases:
+            formatted = formatter.format(code, Path())
+            self.assertEqual(expected, formatted)
+            # formatting must be stable
+            self.assertEqual(expected, formatter.format(formatted, Path()))
+
+    def test_format_directives(self) -> None:
+        formatter = Formatter(None, use_editor_config=False, fetch_subdirs=False)
+        cases = [
+            # off/on pair
+            ('x=[1,2]\n# meson-format off\ny  =  [1,\n  2]\n# meson-format on\nz=[1,2]\n',
+             'x = [1, 2]\n# meson-format off\ny  =  [1,\n  2]\n# meson-format on\nz = [1, 2]\n'),
+            # lone off disables formatting until the end of file
+            ('x=[1,2]\n# meson-format off\ny  =  [1,\n  2]',
+             'x = [1, 2]\n# meson-format off\ny  =  [1,\n  2]'),
+            # lone on and duplicated off are no-ops
+            ('# meson-format on\nx=[1,2]\n',
+             '# meson-format on\nx = [1, 2]\n'),
+            ('# meson-format off\nx=[1,2]\n# meson-format off\ny=[1,2]\n# meson-format on\nz=[1,2]\n',
+             '# meson-format off\nx=[1,2]\n# meson-format off\ny=[1,2]\n# meson-format on\nz = [1, 2]\n'),
+            # indented and loosely spelled directives
+            ('if true\n#meson-format   off\n  y  =  [1,\n  2]\n    #  meson-format on\nz=1\nendif\n',
+             'if true\n    #meson-format   off\n  y  =  [1,\n  2]\n    #  meson-format on\n    z = 1\nendif\n'),
+            # muon compatible directives
+            ('# fmt: off\nx  =  [1,2]\n#fmt:on\ny=[1,2]\n',
+             '# fmt: off\nx  =  [1,2]\n#fmt:on\ny = [1, 2]\n'),
+            ('# fmt:off\nx  =  [1,2]\n# meson-format on\ny=[1,2]\n',
+             '# fmt:off\nx  =  [1,2]\n# meson-format on\ny = [1, 2]\n'),
+            # not a directive
+            ('# meson-format offset\nx=[1,2]\n',
+             '# meson-format offset\nx = [1, 2]\n'),
+            ('# fmt off\nx=[1,2]\n',
+             '# fmt off\nx = [1, 2]\n'),
+            # directives inside strings are ignored
+            ("s='''\n# meson-format off\n'''\ny=[1,2]\n",
+             "s = '''\n# meson-format off\n'''\ny = [1, 2]\n"),
+            ("s='# meson-format off'\ny=[1,2]\n",
+             "s = '# meson-format off'\ny = [1, 2]\n"),
+        ]
+        for code, expected in cases:
+            with self.subTest(code=code):
+                formatted = formatter.format(code, Path())
+                self.assertEqual(expected, formatted)
+                self.assertEqual(formatted, formatter.format(formatted, Path()))
+
+        errors = [
+            ('x = [1, 2]  # meson-format off\n', 1, 12, 'must be on its own line'),
+            ('if true\n    x = 1 # meson-format on\nendif\n', 2, 10, 'must be on its own line'),
+            ("x = files(\n    'b.c',\n    # meson-format off\n    'a.c',\n)\n", 3, 4, 'must enclose whole statements'),
+            ('x = [\n    # meson-format on\n]\n', 2, 4, 'must enclose whole statements'),
+            ('if (true and\n# meson-format off\nfalse)\nendif\n', 2, 0, 'must enclose whole statements'),
+            ('x = 1  # fmt: off\n', 1, 7, '"# fmt: off" directive must be on its own line'),
+            ('x = [\n    # fmt:on\n]\n', 2, 4, '"# fmt:on" directive must enclose whole statements'),
+        ]
+        for code, lineno, colno, message in errors:
+            with self.subTest(code=code):
+                with self.assertRaisesRegex(MesonException, message) as cm:
+                    formatter.format(code, Path())
+                self.assertEqual((cm.exception.lineno, cm.exception.colno), (lineno, colno))
+
+    def test_format_directives_recursive(self) -> None:
+        dirpath = tempfile.mkdtemp()
+        self.addCleanup(windows_proof_rmtree, dirpath)
+
+        root = Path(dirpath, 'meson.build')
+        root.write_text("project('a')\nsubdir('sub')\n# meson-format off\nx  =  [1,2]\n", encoding='utf-8')
+        sub = Path(dirpath, 'sub', 'meson.build')
+        sub.parent.mkdir()
+        sub.write_text('y  =  [1,2]\n', encoding='utf-8')
+
+        self._run(self.meson_command + ['format', '-r', '-i'], workdir=dirpath)
+        self.assertEqual("project('a')\nsubdir('sub')\n# meson-format off\nx  =  [1,2]\n",
+                         root.read_text(encoding='utf-8'))
+        self.assertEqual('y = [1, 2]\n', sub.read_text(encoding='utf-8'))
 
     def test_error_configuring_subdir(self):
         testdir = os.path.join(self.common_test_dir, '152 index customtarget')
@@ -672,7 +794,23 @@ class PlatformAgnosticTests(BasePlatformTests):
 
     def test_configure_file_relative_path_depfile(self):
         testdir = os.path.join(self.common_test_dir, "14 configure file")
-        out = self.init(testdir)
+        self.init(testdir)
         self.utime(os.path.join(testdir, 'depfile'))
         ret = self.build(stderr=False)
         self.assertIn('The Meson build system', ret)
+
+    def test_build_dat_environment_consistent(self):
+        testdir = os.path.join(self.common_test_dir, '1 trivial')
+        self.init(testdir)
+        # The Environment is the one that was saved, it is not created again.
+        with mock.patch.object(mesonbuild.environment.Environment, '__init__',
+                               side_effect=AssertionError('Environment was created')):
+            b = mesonbuild.build.load(self.builddir)
+        env = b.environment
+        targets = [t for t in b.get_targets().values() if isinstance(t, mesonbuild.build.BuildTarget)]
+        self.assertTrue(targets)
+        for t in targets:
+            self.assertTrue(t.compilers)
+            for lang, compiler in t.compilers.items():
+                self.assertIs(compiler, env.coredata.compilers[t.for_machine][lang])
+                self.assertIs(compiler.environment, env)

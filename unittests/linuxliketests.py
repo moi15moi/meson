@@ -1385,6 +1385,8 @@ class LinuxlikeTests(BasePlatformTests):
         '''
         if is_cygwin():
             raise SkipTest('rpath are not used on Cygwin')
+        if 'MESON_RSP_THRESHOLD' in os.environ:
+            raise SkipTest('MESON_RSP_THRESHOLD affects contents of build.ninja')
         testdir = os.path.join(self.unit_test_dir, '41 rpath order')
         self.init(testdir)
         if is_osx():
@@ -1878,14 +1880,14 @@ class LinuxlikeTests(BasePlatformTests):
         # Verify that "gcc -m32" works
         try:
             self.do_one_test_with_nativefile('1 trivial', "['gcc', '-m32']")
-        except subprocess.CalledProcessError as e:
+        except subprocess.CalledProcessError:
             raise SkipTest('Not GCC, or GCC does not have the -m32 option')
         self.wipe()
 
         # Verify that cmake works
         try:
             self.do_one_test_with_nativefile('../cmake/1 basic', "['gcc']")
-        except subprocess.CalledProcessError as e:
+        except subprocess.CalledProcessError:
             raise SkipTest('Could not build basic cmake project')
         self.wipe()
 
@@ -1950,6 +1952,8 @@ class LinuxlikeTests(BasePlatformTests):
 
     @skipUnless(is_linux(), "Ninja file differs on different platforms")
     def test_complex_link_cases(self):
+        if 'MESON_RSP_THRESHOLD' in os.environ:
+            raise SkipTest('MESON_RSP_THRESHOLD affects contents of build.ninja')
         testdir = os.path.join(self.unit_test_dir, '114 complex link cases')
         self.init(testdir)
         self.build()

@@ -10,9 +10,7 @@ from mesonbuild import _pathlib
 import sys
 sys.modules['pathlib'] = _pathlib
 
-import collections
 import os
-import time
 import shutil
 import subprocess
 import platform
@@ -32,16 +30,15 @@ from mesonbuild import mesonlib
 from mesonbuild import mesonmain
 from mesonbuild import mtest
 from mesonbuild import mlog
-from mesonbuild.environment import Environment
+from mesonbuild.environment import EmptyCMDOptions, Environment
 from mesonbuild.envconfig import detect_machine_info
 from mesonbuild.tooldetect import detect_ninja
 from mesonbuild.coredata import version as meson_version
 from mesonbuild.options import backendlist
 from mesonbuild.mesonlib import setup_vsenv
-from mesonbuild.options import OptionKey
 
 if T.TYPE_CHECKING:
-    from mesonbuild.coredata import SharedCMDOptions
+    from mesonbuild.cmdline import SharedCMDOptions
 
 NINJA_1_12_OR_NEWER = False
 NINJA_CMD = None
@@ -139,12 +136,8 @@ class FakeBuild:
         self.machine_map = env.machine_map
 
 def get_fake_options(prefix: str = '') -> SharedCMDOptions:
-    opts = T.cast('SharedCMDOptions', argparse.Namespace())
-    opts.native_file = []
-    opts.cross_file = None
-    opts.wrap_mode = None
-    opts.prefix = prefix
-    opts.cmd_line_options = {}
+    opts = EmptyCMDOptions()
+    opts.cmd_line_options = {'prefix': prefix}
     return opts
 
 def get_fake_env(sdir: str = '', bdir: T.Optional[str] = None, prefix: str = '',

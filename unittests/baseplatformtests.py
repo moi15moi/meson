@@ -31,7 +31,7 @@ import mesonbuild.modules.pkgconfig
 
 
 from run_tests import (
-    Backend, get_backend_commands,
+    Backend, get_backend_commands, get_fake_env,
     get_builddir_target_args, get_meson_script, run_configure_inprocess,
     run_mtest_inprocess, handle_meson_skip_test,
 )
@@ -238,7 +238,7 @@ class BasePlatformTests(TestCase):
         if inprocess:
             try:
                 returncode, out, err = run_configure_inprocess(['setup'] + self.meson_args + args + extra_args + build_and_src_dir_args, override_envvars)
-            except Exception as e:
+            except Exception:
                 if not allow_fail:
                     self._print_meson_log()
                     raise
@@ -328,6 +328,10 @@ class BasePlatformTests(TestCase):
             if x.get('name') == optname:
                 return x.get('value')
         self.fail(f'Option {optname} not found')
+
+    def load_coredata(self) -> mesonbuild.coredata.CoreData:
+        env = get_fake_env('', self.builddir, self.prefix)
+        return mesonbuild.coredata.load(self.builddir, env)
 
     def wipe(self):
         windows_proof_rmtree(self.builddir)

@@ -200,9 +200,9 @@ class CMakeDependency(ExternalDependency):
         root_paths = [x for x in root_paths if os.path.isdir(x)]
         module_paths_set = process_paths(temp_parser.get_cmake_var('MESON_PATHS_LIST'))
         rooted_paths: T.List[str] = []
-        for j in [Path(x) for x in root_paths]:
-            for p in [Path(x) for x in module_paths_set]:
-                rooted_paths.append(str(j / p.relative_to(p.anchor)))
+        rooted_paths.extend(str(j / p.relative_to(p.anchor))
+                            for j in [Path(x) for x in root_paths]
+                            for p in [Path(x) for x in module_paths_set])
         module_paths = sorted(module_paths_set.union(rooted_paths))
         module_paths = [x for x in module_paths if os.path.isdir(x)]
         archs = temp_parser.get_cmake_var('MESON_ARCH_LIST')
@@ -331,12 +331,12 @@ class CMakeDependency(ExternalDependency):
             return True
 
         # Check the Linux CMake registry
-        linux_reg = Path.home() / '.cmake' / 'packages'
-        for p in [linux_reg / name, linux_reg / lname]:
-            if p.exists():
-                return True
+        return self._in_cmake_user_registry(name, lname)
 
-        return False
+    @staticmethod
+    def _in_cmake_user_registry(name: str, lname: str) -> bool:
+        # Like CMake, treat an unreadable or unresolvable home as "not registered".
+        return any(CMakeDependency._cached_isdir(os.path.expanduser(f'~/.cmake/packages/{n}')) for n in (name, lname))
 
     def _detect_dep(self, name: str, package_version: str, modules: T.List[T.Tuple[str, bool]], components: T.List[T.Tuple[str, bool]], args: T.List[str]) -> None:
         # Detect a dependency with CMake using the '--find-package' mode

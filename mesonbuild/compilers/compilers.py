@@ -32,7 +32,7 @@ if T.TYPE_CHECKING:
     from ..options import MutableKeyedOptionDictType
     from ..envconfig import MachineInfo
     from ..environment import Environment
-    from ..linkers import RSPFileSyntax
+    from ..backend.rspfile import RSPFileSyntax
     from ..linkers.linkers import DynamicLinker
     from ..mesonlib import MachineChoice
     from ..dependencies import Dependency
@@ -1297,6 +1297,10 @@ class Compiler(HoldableObject, metaclass=SimpleABC):
     def get_preprocess_to_file_args(self) -> T.List[str]:
         return self.get_preprocess_only_args()
 
+    def get_preprocess_override_args(self) -> T.List[str]:
+        """Arguments that must override CFLAGS and similar when preprocessing to a file."""
+        return []
+
     def get_default_include_dirs(self) -> T.List[str]:
         # TODO: This is a candidate for returning an immutable list
         return []
@@ -1352,11 +1356,35 @@ class Compiler(HoldableObject, metaclass=SimpleABC):
     def get_pch_use_args(self, pch_dir: str, header: str) -> T.List[str]:
         raise EnvironmentException(f'{self.id} does not support pre compiled headers')
 
+    def get_pch_create_args(self) -> T.List[str]:
+        """Arguments for building the precompiled header, not for sources that use it."""
+        return []
+
     def get_has_func_attribute_extra_args(self, name: str) -> T.List[str]:
         raise EnvironmentException(f'{self.id} does not support function attributes')
 
     def name_string(self) -> str:
         return ' '.join(self.exelist)
+
+    def _compile_sanity_check(self, cmdlist: T.List[str], linker_args: T.List[str],
+                              work_dir: str) -> None:
+        """Run the compiler command line of a sanity check.
+
+        :param cmdlist: The executable and compiler arguments
+        :param linker_args: Linker arguments, appended after the compiler arguments
+        :param work_dir: A directory to put temporary artifacts
+        :raises mesonlib.EnvironmentException: If the compiler returns a non-zero exit code
+        """
+        cmdlist = cmdlist + linker_args
+        pc, stdo, stde = mesonlib.Popen_safe(cmdlist, cwd=work_dir)
+        mlog.debug('Sanity check compiler command line:', mesonlib.join_args(cmdlist))
+        mlog.debug('Sanity check compile stdout:')
+        mlog.debug(stdo)
+        mlog.debug('-----\nSanity check compile stderr:')
+        mlog.debug(stde)
+        mlog.debug('-----')
+        if pc.returncode != 0:
+            raise mesonlib.EnvironmentException(f'Compiler {self.name_string()} cannot compile programs.')
 
     def sanity_check(self, work_dir: str) -> None:
         """Check that this compiler actually works.
@@ -1400,17 +1428,7 @@ class Compiler(HoldableObject, metaclass=SimpleABC):
         else:
             cmdlist, linker_args = self._sanity_check_compile_args(sourcename, binname)
 
-        cmdlist.extend(linker_args)
-        pc, stdo, stde = mesonlib.Popen_safe(cmdlist, cwd=work_dir)
-        mlog.debug('Sanity check compiler command line:', mesonlib.join_args(cmdlist))
-        mlog.debug('Sanity check compile stdout:')
-        mlog.debug(stdo)
-        mlog.debug('-----\nSanity check compile stderr:')
-        mlog.debug(stde)
-        mlog.debug('-----')
-        if pc.returncode != 0:
-            raise mesonlib.EnvironmentException(f'Compiler {self.name_string()} cannot compile programs.')
-
+        self._compile_sanity_check(cmdlist, linker_args, work_dir)
         self._run_sanity_check([os.path.join(work_dir, binname)], work_dir)
 
     def _sanity_check_filenames(self) -> T.Tuple[str, T.Optional[str], str]:
@@ -1715,6 +1733,11 @@ class Compiler(HoldableObject, metaclass=SimpleABC):
         be implemented
         """
         return self.linker.rsp_file_syntax()
+
+    def linker_rsp_file_syntax(self) -> 'RSPFileSyntax':
+        """The format of the RSP file used when this compiler is used as
+           the link_language."""
+        return self.rsp_file_syntax()
 
     def get_debug_args(self, is_debug: bool) -> T.List[str]:
         """Arguments required for a debug build."""

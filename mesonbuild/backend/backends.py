@@ -33,6 +33,7 @@ from ..mesonlib import (
     get_rsp_threshold, unique_list
 )
 from ..options import OptionKey
+from .rspfile import RSPFileSyntax, rsp_file_contents, rsp_file_flag
 
 
 if T.TYPE_CHECKING:
@@ -76,6 +77,8 @@ class RegenInfo:
     source_dir: str
     build_dir: str
     depfiles: T.List[str]
+    meson_command: T.List[str]
+    backend: str
 
 class TestProtocol(enum.Enum):
 
@@ -623,8 +626,7 @@ class Backend:
                         obj_list.extend(result[obj.target])
                     new_objs = self._determine_ext_objs(obj)
                     if proj_dir_to_build_root:
-                        for o in new_objs:
-                            obj_list.append(os.path.join(proj_dir_to_build_root, o))
+                        obj_list.extend(os.path.join(proj_dir_to_build_root, o) for o in new_objs)
                     else:
                         obj_list.extend(new_objs)
                 else:
@@ -649,8 +651,7 @@ class Backend:
 
     def determine_swift_dep_dirs(self, target: build.BuildTarget) -> T.List[str]:
         result: T.List[str] = []
-        for l in target.link_targets:
-            result.append(self.get_target_private_dir_abs(l))
+        result.extend(self.get_target_private_dir_abs(l) for l in target.link_targets)
         return result
 
     def get_exe_interpreter(self, exe_cmd: T.List[str], for_machine: MachineChoice) -> T.List[str]:
@@ -677,9 +678,7 @@ class Backend:
             capture: T.Optional[str] = None,
             feed: T.Optional[str] = None,
             env: T.Optional[mesonlib.EnvironmentVariables] = None,
-            can_use_rsp_file: bool = False,
-            separator: str = ' ',
-            rsp_file_flag: str = '@',
+            rsp_syntax: T.Optional[RSPFileSyntax] = None,
             tag: T.Optional[str] = None,
             verbose: bool = False,
             installdir_map: T.Optional[T.Dict[str, str]] = None) -> 'ExecutableSerialisation':
@@ -744,18 +743,18 @@ class Backend:
         workdir = workdir or self.environment.get_build_dir()
 
         # Must include separators as well
-        needs_rsp_file = can_use_rsp_file and sum(len(i) + 1 for i in cmd_args) >= get_rsp_threshold()
+        needs_rsp_file = rsp_syntax is not None and sum(len(i) + 1 for i in cmd_args) >= get_rsp_threshold()
 
         if needs_rsp_file:
             hasher = hashlib.sha1()
-            args = separator.join(mesonlib.quote_arg(arg) for arg in cmd_args)
+            args = rsp_file_contents(rsp_syntax, cmd_args)
             hasher.update(args.encode(encoding='utf-8', errors='ignore'))
             digest = hasher.hexdigest()
             scratch_file = f'meson_rsp_{digest}.rsp'
             rsp_file = os.path.join(self.environment.get_scratch_dir(), scratch_file)
             with open(rsp_file, 'w', encoding='utf-8', newline='\n') as f:
                 f.write(args)
-                cmd_args = [f'{rsp_file_flag}{rsp_file}']
+                cmd_args = [f'{rsp_file_flag(rsp_syntax)}{rsp_file}']
 
         return ExecutableSerialisation(exe_cmd + cmd_args, env,
                                        exe_wrapper, workdir,
@@ -769,9 +768,7 @@ class Backend:
                              feed: T.Optional[str] = None,
                              force_serialize: bool = False,
                              env: T.Optional[mesonlib.EnvironmentVariables] = None,
-                             can_use_rsp_file: bool = False,
-                             separator: str = ' ',
-                             rsp_file_flag: str = '@',
+                             rsp_syntax: T.Optional[RSPFileSyntax] = None,
                              verbose: bool = False) -> T.Tuple[T.List[str], str]:
         '''
         Serialize an executable for running with a generator or a custom target
@@ -779,7 +776,7 @@ class Backend:
         cmd: T.List[build.CommandTypes] = []
         cmd.append(exe)
         cmd.extend(cmd_args)
-        es = self.get_executable_serialisation(cmd, workdir, extra_bdeps, capture, feed, env, can_use_rsp_file, separator=separator, rsp_file_flag=rsp_file_flag, verbose=verbose)
+        es = self.get_executable_serialisation(cmd, workdir, extra_bdeps, capture, feed, env, rsp_syntax=rsp_syntax, verbose=verbose)
         reasons: T.List[str] = []
         if es.extra_paths:
             reasons.append('to set PATH')
@@ -796,8 +793,8 @@ class Backend:
         if env and env.varnames:
             reasons.append('to set env')
 
-        if separator != ' ':
-            reasons.append('to use a custom argument separator')
+        if rsp_syntax is RSPFileSyntax.NASM:
+            reasons.append('to use a response file')
 
         # force_serialize passed to this function means that the VS backend has
         # decided it absolutely cannot use real commands. This is "always",
@@ -822,7 +819,7 @@ class Backend:
                 envlist.append(f'{k}={v}')
             return ['env'] + envlist + es.cmd_args, ', '.join(reasons)
 
-        if can_use_rsp_file and any(a.startswith(rsp_file_flag) for a in es.cmd_args):
+        if rsp_syntax is not None and any(a.startswith(rsp_file_flag(rsp_syntax)) for a in es.cmd_args):
             reasons.append('because command is too long')
 
         if not force_serialize:
@@ -1096,6 +1093,8 @@ class Backend:
         ext_args = self.environment.coredata.get_option_for_target(target, f'{compiler.get_language()}_args')
         assert isinstance(ext_args, list), 'for mypy'
         commands += ext_args
+        if compiler.mode == 'PREPROCESSOR':
+            commands += compiler.get_preprocess_override_args()
         # Using both /Z7 or /ZI and /Zi at the same times produces a compiler warning.
         # We do not add /Z7 or /ZI by default. If it is being used it is because the user has explicitly enabled it.
         # /Zi needs to be removed in that case to avoid cl's warning to that effect (D9025 : overriding '/Zi' with '/ZI')
@@ -1470,9 +1469,13 @@ class Backend:
 
     def generate_regen_info(self) -> None:
         deps = self.get_regen_filelist()
+        backend = self.environment.coredata.optstore.get_value_for(OptionKey('backend'))
+        assert isinstance(backend, str)
         regeninfo = RegenInfo(self.environment.get_source_dir(),
                               self.environment.get_build_dir(),
-                              deps)
+                              deps,
+                              self.environment.coredata.meson_command,
+                              backend)
         filename = os.path.join(self.environment.get_scratch_dir(),
                                 'regeninfo.dump')
         with open(filename, 'wb') as f:
@@ -1551,9 +1554,8 @@ class Backend:
     @lru_cache(maxsize=None)
     def get_custom_target_provided_by_generated_source(self, generated_source: build.CustomTarget) -> 'ImmutableListProtocol[str]':
         libs: T.List[str] = []
-        for f in generated_source.get_outputs():
-            if compilers.is_library(f):
-                libs.append(os.path.join(self.get_target_dir(generated_source), f))
+        libs.extend(os.path.join(self.get_target_dir(generated_source), f)
+                    for f in generated_source.get_outputs() if compilers.is_library(f))
         return libs
 
     @lru_cache(maxsize=None)

@@ -44,19 +44,6 @@ BUILD_TARGET_FUNCTIONS = [
     'static_library', 'both_libraries'
 ]
 
-class IntrospectionHelper:
-    # mimic an argparse namespace
-    def __init__(self, cross_file: T.Optional[str]):
-        self.cross_file = [cross_file] if cross_file is not None else []
-        self.native_file: T.List[str] = []
-        self.cmd_line_options: T.Dict[OptionKey, str] = {}
-        self.builtin_keys: T.Set[OptionKey] = set()
-        self.d_keys: T.Set[OptionKey] = set()
-        self.projectoptions: T.List[str] = []
-
-    def __eq__(self, other: object) -> bool:
-        return NotImplemented
-
 class IntrospectionInterpreter(AstInterpreter):
     # If you run `meson setup ...` the `Interpreter`-class walks over the AST.
     # If you run `meson rewrite ...` and `meson introspect meson.build ...`,
@@ -73,13 +60,13 @@ class IntrospectionInterpreter(AstInterpreter):
                  subproject_dir: str = 'subprojects',
                  env: T.Optional[environment.Environment] = None,
                  invoker_method_default_options: T.Optional[OptionDict] = None):
-        options = IntrospectionHelper(cross_file)
+        options = environment.EmptyCMDOptions(cross_file)
         env_ = env or environment.Environment(source_root, None, options)
         super().__init__(source_root, subdir, subproject, subproject_dir, env_, visitors=visitors)
 
         self.cross_file = cross_file
         self.backend = backend
-        self.build_project = BuildProject(subproject, '', subproject, MachineChoice.HOST, MachineChoice.HOST)
+        self.build_project = BuildProject(subproject, '', subproject, MachineChoice.HOST, MachineChoice.HOST, subdir)
         self.project_data: T.Dict[str, T.Any] = {}
         self.targets: T.List[IntrospectionBuildTarget] = []
         self.dependencies: T.List[IntrospectionDependency] = []

@@ -1046,13 +1046,14 @@ class Vs2010Backend(backends.Backend):
                     try:
                         # Add source subdir first so that the build subdir overrides it
                         args.append('-I' + os.path.join(proj_to_src_root, curdir))  # src dir
-                        args.append('-I' + self.relpath(curdir, target.subdir)) # build dir
+                        args.append('-I' + self.relpath(d.build_project.prefix + curdir,
+                                                        self.get_target_dir(target)))  # build dir
                     except ValueError:
                         # Include is on different drive
                         args.append('-I' + os.path.normpath(curdir))
                 for i in d.extra_build_dirs:
                     curdir = os.path.join(d.curdir, i)
-                    args.append('-I' + self.relpath(curdir, target.subdir))  # build dir
+                    args.append('-I' + self.relpath(curdir, self.get_target_dir(target)))  # build dir
         # Add per-target compile args, f.ex, `c_args : ['/DFOO']`. We set these
         # near the end since these are supposed to override everything else.
         for l, args in target.extra_args.items():
@@ -1819,8 +1820,7 @@ class Vs2010Backend(backends.Backend):
         for o in self.flatten_object_list(target, proj_to_build_root)[0]:
             assert isinstance(o, str)
             additional_objects.append(o)
-        for o in custom_objs:
-            additional_objects.append(o)
+        additional_objects.extend(custom_objs)
 
         # VS automatically links CustomBuild outputs whose name ends in .obj or .res,
         # but the others need to be included explicitly

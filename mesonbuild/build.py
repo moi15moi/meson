@@ -10,13 +10,14 @@ import copy
 import hashlib
 import itertools, pathlib
 import os
-import pickle
 import re
+import shutil
 import textwrap
 import typing as T
 
 from . import coredata
 from . import dependencies
+from . import meson_pickle
 from . import mlog
 from . import programs
 from .environment import MachineMap
@@ -26,7 +27,7 @@ from .mesonlib import (
     OrderedSet, classify_unity_sources, ROOT_SUBPROJECT,
     get_filenames_templates_dict, substitute_values, has_path_sep,
     is_parent_path, relpath, PerMachineDefaultable,
-    MesonBugException, EnvironmentVariables, pickle_load, lazy_property,
+    MesonBugException, EnvironmentVariables, lazy_property,
     unwrap,
 )
 from .options import OptionKey
@@ -45,6 +46,7 @@ if T.TYPE_CHECKING:
     from .environment import Environment
     from ._typing import ImmutableListProtocol
     from .backend.backends import Backend
+    from .backend.rspfile import RSPFileSyntax
     from .compilers.compilers import Compiler, CompilerDict, Language
     from .compilers.rust import RustCompiler
     from .interpreter.interpreter import CustomTargetSources, SourceOutputs, Interpreter
@@ -416,6 +418,52 @@ class DepManifest:
         }
 
 
+class Summary:
+    def __init__(self) -> None:
+        self.sections: defaultdict[str, dict[str, tuple[mlog.TV_LoggableList, str | None]]] = defaultdict(dict)
+        self.max_key_len = 0
+
+    def add_value(self, section: str, key: str, values: mlog.TV_LoggableList,
+                  list_sep: str | None) -> None:
+        if key in self.sections[section]:
+            raise MesonException(f'Summary section {section!r} already have key {key!r}')
+        self.sections[section][key] = (values, list_sep)
+        self.max_key_len = max(self.max_key_len, len(key))
+
+    def dump(self) -> None:
+        for section, values in self.sections.items():
+            mlog.log('')  # newline
+            if section:
+                mlog.log(' ', mlog.bold(section))
+            for k, v in values.items():
+                v, list_sep = v
+                padding = self.max_key_len - len(k)
+                end = ' ' if v else ''
+                mlog.log(' ' * 3, k + ' ' * padding + ':', end=end)
+                indent = self.max_key_len + 6
+                self.dump_value(v, list_sep, indent)
+        mlog.log('')  # newline
+
+    def dump_value(self, arr: mlog.TV_LoggableList, list_sep: str | None, indent: int) -> None:
+        lines_sep = '\n' + ' ' * indent
+        if list_sep is None:
+            mlog.log(*arr, sep=lines_sep, display_timestamp=False)
+            return
+        max_len = shutil.get_terminal_size().columns
+        line: mlog.TV_LoggableList = []
+        line_len = indent
+        lines_sep = list_sep.rstrip() + lines_sep
+        for v in arr:
+            v_len = len(str(v)) + len(list_sep)
+            if line and line_len + v_len > max_len:
+                mlog.log(*line, sep=list_sep, end=lines_sep)
+                line_len = indent
+                line = []
+            line.append(v)
+            line_len += v_len
+        mlog.log(*line, sep=list_sep, display_timestamp=False)
+
+
 @dataclass(eq=False)
 class BuildProject:
     name: str
@@ -430,12 +478,27 @@ class BuildProject:
     #    HOST           BUILD               BUILD ("native: true")
     orig_for_machine: MachineChoice
     for_machine: MachineChoice
+    subdir: str
     project_args: PerMachine[T.Dict[Language, T.List[str]]] = field(default_factory=lambda: PerMachine({}, {}))
     project_link_args: PerMachine[T.Dict[Language, T.List[str]]] = field(default_factory=lambda: PerMachine({}, {}))
+    summary: Summary = field(default_factory=Summary)
 
     @lazy_property
     def prefix(self) -> str:
-        return 'build.' if self.for_machine is MachineChoice.BUILD else ''
+        return self.for_machine.get_prefix()
+
+    @lazy_property
+    def builddir(self) -> str:
+        return self.prefix + self.subdir
+
+    def dump_summary(self) -> None:
+        if not self.summary.sections:
+            return
+        name = self.name
+        if self.for_machine is MachineChoice.BUILD:
+            name += ' (for build machine)'
+        mlog.log(name, mlog.normal_cyan(self.version))
+        self.summary.dump()
 
 
 # literally everything isn't dataclass stuff
@@ -523,7 +586,10 @@ class Build:
     def copy(self) -> Build:
         other = Build.__new__(Build)
         for k, v in self.__dict__.items():
-            other.__dict__[k] = copy.copy(v)
+            if k == 'environment':
+                other.environment = self.environment
+            else:
+                other.__dict__[k] = copy.copy(v)
         return other
 
     def copy_for_build_machine(self) -> Build:
@@ -542,12 +608,12 @@ class Build:
 
     def merge(self, other: Build) -> None:
         for k, v in other.__dict__.items():
-            # This one is modified for build-only configs, but it is
-            # local.  No need to copy it.
-            if k == 'machine_map':
+            # These ones are modified for build-only configs, but they are
+            # local.  No need to copy back.
+            if k in {'machine_map', 'for_machine'}:
                 continue
             # These are not modified in subprojects
-            if k in {'global_args', 'global_link_args'}:
+            if k in {'global_args', 'global_link_args', 'environment'}:
                 continue
 
             if isinstance(v, PerMachine):
@@ -671,8 +737,7 @@ class IncludeDirs(HoldableObject):
         for idir in self.incdirs:
             strlist.append(os.path.join(sourcedir, self.curdir, idir))
             strlist.append(os.path.join(builddir, bsubdir, idir))
-        for idir in self.extra_build_dirs:
-            strlist.append(os.path.join(builddir, bsubdir, idir))
+        strlist.extend(os.path.join(builddir, self.curdir, idir) for idir in self.extra_build_dirs)
         return strlist
 
     def rel_string_list(self, build_to_src: str, build_root: T.Optional[str] = None) -> T.List[str]:
@@ -686,13 +751,15 @@ class IncludeDirs(HoldableObject):
         strlist: T.List[str] = []
         bsubdir = self.build_project.prefix + self.curdir
 
-        for idirs, add_src in [(self.incdirs, True), (self.extra_build_dirs, False)]:
-            for idir in idirs:
-                bld_dir = os.path.normpath(os.path.join(bsubdir, idir))
-                if build_root is None or os.path.isdir(os.path.join(build_root, bld_dir)):
-                    strlist.append(bld_dir)
-                if add_src:
-                    strlist.append(os.path.normpath(os.path.join(build_to_src, self.curdir, idir)))
+        for idir in self.incdirs:
+            bld_dir = os.path.normpath(os.path.join(bsubdir, idir))
+            if build_root is None or os.path.isdir(os.path.join(build_root, bld_dir)):
+                strlist.append(bld_dir)
+            strlist.append(os.path.normpath(os.path.join(build_to_src, self.curdir, idir)))
+        for idir in self.extra_build_dirs:
+            bld_dir = os.path.normpath(os.path.join(self.curdir, idir))
+            if build_root is None or os.path.isdir(os.path.join(build_root, bld_dir)):
+                strlist.append(bld_dir)
 
         return strlist
 
@@ -718,11 +785,9 @@ class ExtractedObjects(HoldableObject):
         # Merge sources and generated sources
         ret: T.List[FileOrString] = list(sources)
         for gensrc in generated_sources:
-            for s in gensrc.get_outputs():
-                # We cannot know the path where this source will be generated,
-                # but all we need here is the file extension to determine the
-                # compiler.
-                ret.append(s)
+            # We cannot know the path where this source will be generated, but
+            # all we need here is the file extension to determine the compiler.
+            ret.extend(gensrc.get_outputs())
 
         # Filter out headers and all non-source files
         return [s for s in ret if is_source(s)]
@@ -1062,6 +1127,7 @@ class BuildTarget(Target, BuildTargetProto):
                     This will become a hard error in a future Meson release.
                 '''))
         self.link_early_args = kwargs.get('link_early_args', [])
+        self.extra_files = list(kwargs.get('extra_files', []))
         # Target-specific include dirs must be added BEFORE include dirs from
         # internal deps (added inside self.add_deps()) to override them.
         self.add_include_dirs(kwargs.get('include_directories', []))
@@ -1079,7 +1145,6 @@ class BuildTarget(Target, BuildTargetProto):
         self.install_dir: T.List[T.Union[str, T.Literal[False]]] = [install_dir]
         self.install_mode = kwargs.get('install_mode', None)
         self.install_tag: T.List[T.Optional[str]] = kwargs.get('install_tag') or [None]
-        self.extra_files = kwargs.get('extra_files', [])
         self.install_rpath: str = kwargs.get('install_rpath', '')
         self.build_rpath = kwargs.get('build_rpath', '')
         self.resources = kwargs.get('resources', [])
@@ -1354,19 +1419,12 @@ class BuildTarget(Target, BuildTargetProto):
                         generated.append(src)
 
         # All generated sources
-        for gensrc in generated:
-            for s in gensrc.get_outputs():
-                # Generated objects can't be compiled, so don't use them for
-                # compiler detection. If our target only has generated objects,
-                # we will fall back to using the first c-like compiler we find,
-                # which is what we need.
-                if not is_object(s):
-                    sources.append(s)
+        # Generated objects can't be compiled, so don't use them for compiler
+        # detection. If our target only has generated objects, we will fall back
+        # to using the first c-like compiler we find, which is what we need.
+        sources.extend(s for gensrc in generated for s in gensrc.get_outputs() if not is_object(s))
 
-        for d in self.external_deps:
-            for s in d.sources:
-                if isinstance(s, File):
-                    sources.append(s)
+        sources.extend(s for d in self.external_deps for s in d.sources if isinstance(s, File))
 
         # Sources that were used to create our extracted objects
         for o in self.objects:
@@ -2132,12 +2190,14 @@ class Generator(HoldableObject):
                  depfile: T.Optional[str] = None,
                  capture: bool = False,
                  depends: T.Optional[T.Sequence[TargetDepends]] = None,
+                 depend_files: T.Optional[T.Sequence[File]] = None,
                  name: str = 'Generator'):
         self.environment = env
         self.exe = exe
         self.depfile = depfile
         self.capture = capture
         self.depends: T.List[TargetDepends] = list(depends or [])
+        self.depend_files: T.List[File] = list(depend_files or [])
         self.arglist = arguments
         self.outputs = output
         self.name = name
@@ -2225,7 +2285,7 @@ class GeneratedList(HoldableObject):
         self.infilelist: T.List[FileMaybeInTargetPrivateDir] = []
         self.outfilelist: T.List[str] = []
         self.outmap: T.Dict[FileMaybeInTargetPrivateDir, T.List[str]] = {}
-        self.depend_files: T.List[File] = []
+        self.depend_files: T.List[File] = self.generator.depend_files.copy()
 
         if self.extra_args is None:
             self.extra_args: T.List[str] = []
@@ -3117,7 +3177,7 @@ class CustomTarget(Target, CustomTargetBase, CommandTargetProto):
                  install_dir: T.Optional[T.List[T.Union[str, Literal[False]]]] = None,
                  install_mode: T.Optional[FileMode] = None,
                  install_tag: T.Optional[T.List[T.Optional[str]]] = None,
-                 rspable: bool = False,
+                 rsp_syntax: T.Optional[RSPFileSyntax] = None,
                  absolute_paths: bool = False,
                  backend: T.Optional['Backend'] = None,
                  description: str = 'Generating {} with a custom command',
@@ -3156,7 +3216,7 @@ class CustomTarget(Target, CustomTargetBase, CommandTargetProto):
         self.absolute_paths = absolute_paths
 
         # Whether to enable using response files for the underlying tool
-        self.rspable = rspable
+        self.rsp_syntax = rsp_syntax
 
         self.extra_depends: T.List[T.Union[GeneratedList, BuildTargetProto]] = []
         if extra_depends:
@@ -3238,9 +3298,7 @@ class CustomTarget(Target, CustomTargetBase, CommandTargetProto):
 
     def get_generated_lists(self) -> T.List[GeneratedList]:
         genlists: T.List[GeneratedList] = []
-        for c in self.sources:
-            if isinstance(c, GeneratedList):
-                genlists.append(c)
+        genlists.extend(c for c in self.sources if isinstance(c, GeneratedList))
         return genlists
 
     def get_generated_sources(self) -> T.Iterable[GeneratedTypes]:
@@ -3368,6 +3426,8 @@ class CompileTarget(BuildTarget):
         self.outputs = []
         self.sources_map: T.Dict[File, str] = {}
         self.depends = list(depends or [])
+        self.private_dir = os.path.relpath(backend.get_target_private_dir(self),
+                                           backend.get_target_dir(self))
         for f in self.sources:
             self._add_output(f)
         for gensrc in self.generated:
@@ -3382,7 +3442,7 @@ class CompileTarget(BuildTarget):
         plainname = os.path.basename(f.fname)
         basename = os.path.splitext(plainname)[0]
         o = self.output_templ.replace('@BASENAME@', basename).replace('@PLAINNAME@', plainname)
-        self.outputs.append(o)
+        self.outputs.append(os.path.join(self.private_dir, o))
         self.sources_map[f] = o
 
     def get_generated_headers(self) -> T.List[File]:
@@ -3672,6 +3732,20 @@ class LocalProgram(programs.Program):
         self.program = program
         self.version = version
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, LocalProgram):
+            return False
+        if isinstance(self.program, programs.ExternalProgram):
+            return isinstance(other.program, programs.ExternalProgram) and self.file == other.file
+        else:
+            return self.program is other.program
+
+    def __hash__(self) -> int:
+        if isinstance(self.program, programs.ExternalProgram):
+            return hash(self.file)
+        else:
+            return hash(self.program)
+
     def found(self) -> bool:
         return True
 
@@ -3769,22 +3843,38 @@ def get_sources_string_names(sources: T.Sequence[CustomTargetSources], backend: 
     return names
 
 def load(build_dir: str) -> Build:
+    # A Build consists of three parts, the Environment, the CoreData
+    # and the Build itself.  While all three are reached from a single
+    # Build object, the CoreData is saved separately so that it can
+    # be reused across reconfigurations.
+    #
+    # The complication is that the CoreData refers to the Environment,
+    # so it can only be loaded when an environment is available.
+    # For this reason, the build.dat file contains two pickles that
+    # share their memo; the first is the Environment, which is needed
+    # to load the CoreData, and the second is the Build, which refers
+    # to the Environment through the memo and to the CoreData through
+    # persistent_ids that are arranged by BuildPickler.
+    #
+    # Ideally, only the Environment would have to be saved, and all the
+    # information that meson needs from build.load() would be available
+    # from introspection data.  But until then, here we are.
     filename = os.path.join(build_dir, 'meson-private', 'build.dat')
     try:
-        b = pickle_load(filename, 'Build data', Build)
-        # We excluded coredata when saving Build object, load it separately
-        b.environment.coredata = coredata.load(build_dir)
-        return b
-    except FileNotFoundError:
-        raise MesonException(f'No such build data file as {filename!r}.')
+        with meson_pickle.open_pickle(filename, 'Build data') as f:
+            unpickler = meson_pickle.Unpickler(f)
+            env = unpickler.load()
+            env.coredata = coredata.load(build_dir, env)
+            unpickler.env = env
+            b = unpickler.load()
+    except FileNotFoundError as e:
+        raise MesonException(f'No such build data file as {e.filename!r}.')
+    return meson_pickle.check_loaded(b, filename, 'Build data', Build)
 
 
 def save(obj: Build, filename: str) -> None:
-    # Exclude coredata because we pickle it separately already
-    cdata = obj.environment.coredata
-    obj.environment.coredata = None
-    try:
-        with open(filename, 'wb') as f:
-            pickle.dump(obj, f)
-    finally:
-        obj.environment.coredata = cdata
+    # See load() for the format.
+    with open(filename, 'wb') as f:
+        pickler = meson_pickle.BuildPickler(f, obj.environment)
+        pickler.dump(obj.environment)
+        pickler.dump(obj)
